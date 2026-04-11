@@ -14,7 +14,7 @@ use crate::models::Role;
 use crate::tools::{self, Sandbox};
 
 pub trait Provider: std::fmt::Debug + Send + 'static {
-    fn generate(&self, request: &ProviderRequest, session_id: u64, tx: &Sender<WorkerEvent>);
+    fn generate(&self, request: &ProviderRequest, session_id: String, tx: &Sender<WorkerEvent>);
     fn label(&self) -> &'static str;
 }
 
@@ -26,7 +26,7 @@ impl Provider for EchoProvider {
         "echo"
     }
 
-    fn generate(&self, request: &ProviderRequest, session_id: u64, tx: &Sender<WorkerEvent>) {
+    fn generate(&self, request: &ProviderRequest, session_id: String, tx: &Sender<WorkerEvent>) {
         let last_user = request
             .messages
             .iter()
@@ -49,7 +49,7 @@ impl Provider for EchoProvider {
             thread::sleep(Duration::from_millis(35));
             if tx
                 .send(WorkerEvent::Delta {
-                    session_id,
+                    session_id: session_id.clone(),
                     delta: chunk.to_string(),
                 })
                 .is_err()
@@ -86,7 +86,7 @@ impl Provider for CodexProvider {
         "codex"
     }
 
-    fn generate(&self, request: &ProviderRequest, session_id: u64, tx: &Sender<WorkerEvent>) {
+    fn generate(&self, request: &ProviderRequest, session_id: String, tx: &Sender<WorkerEvent>) {
         let mut messages = request.messages.clone();
 
         for _ in 0..8 {
@@ -113,6 +113,12 @@ impl Provider for CodexProvider {
                 Do not claim to have performed an action unless you have actually called the tool and received a successful result.\n\
                 Be concise, honest, and direct in your responses."
             );
+            
+            if let Some(ref custom) = request.custom_prompt {
+                instructions.push_str("\n\nUser Custom Prompt:\n");
+                instructions.push_str(custom);
+            }
+
             if let Some(ref board) = request.board {
                 instructions.push_str(&format!("\n\nCurrent Project Board State:\n{}", serde_yaml::to_string(board).unwrap_or_default()));
             }
@@ -129,11 +135,11 @@ impl Provider for CodexProvider {
                 "stream": true,
             });
 
-            let (text_content, tool_calls) = match self.client.request(&self.auth, &body, session_id, tx) {
+            let (text_content, tool_calls) = match self.client.request(&self.auth, &body, session_id.clone(), tx) {
                 Ok(res) => res,
                 Err(e) => {
                     let _ = tx.send(WorkerEvent::Error {
-                        session_id,
+                        session_id: session_id.clone(),
                         err: format!("{}", e),
                     });
                     return;
@@ -152,7 +158,7 @@ impl Provider for CodexProvider {
 
             if unique_calls.is_empty() {
                 // We've already emitted deltas during request(), so we just finish.
-                let _ = tx.send(WorkerEvent::Done { session_id });
+                let _ = tx.send(WorkerEvent::Done { session_id: session_id.clone() });
                 return;
             }
 
@@ -167,7 +173,7 @@ impl Provider for CodexProvider {
             }).collect::<Vec<_>>());
 
             let _ = tx.send(WorkerEvent::ToolCalls {
-                session_id,
+                session_id: session_id.clone(),
                 calls: calls_json.clone(),
             });
 
@@ -182,11 +188,11 @@ impl Provider for CodexProvider {
             for call in unique_calls {
                 let slug = tools::tool_slug(&call.name, &call.args);
                 let _ = tx.send(WorkerEvent::SystemNote {
-                    session_id,
+                    session_id: session_id.clone(),
                     note: slug,
                 });
                 let _ = tx.send(WorkerEvent::ToolStatus {
-                    session_id,
+                    session_id: session_id.clone(),
                     status: "running tools...".into(),
                 });
 
@@ -211,7 +217,7 @@ impl Provider for CodexProvider {
 
             let result_content = serde_json::to_string(&tool_outputs).unwrap();
             let _ = tx.send(WorkerEvent::ToolResult {
-                session_id,
+                session_id: session_id.clone(),
                 content: result_content.clone(),
             });
 
@@ -223,7 +229,7 @@ impl Provider for CodexProvider {
         }
 
         let _ = tx.send(WorkerEvent::Error {
-            session_id,
+            session_id: session_id.clone(),
             err: "too many tool-call iterations".into(),
         });
     }

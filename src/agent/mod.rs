@@ -57,12 +57,13 @@ pub struct ProviderRequest {
     pub messages: Vec<ProviderMessage>,
     pub model: String,
     pub board: Option<serde_json::Value>,
+    pub custom_prompt: Option<String>,
 }
 
 #[derive(Debug)]
 pub enum WorkerCmd {
     Send {
-        session_id: u64,
+        session_id: String,
         request: ProviderRequest,
     },
     UpdateProvider {
@@ -74,12 +75,12 @@ pub enum WorkerCmd {
 
 #[derive(Debug)]
 pub enum WorkerEvent {
-    Delta { session_id: u64, delta: String },
-    Done { session_id: u64 },
-    SystemNote { session_id: u64, note: String },
-    ToolStatus { session_id: u64, status: String },
-    ToolCalls { session_id: u64, calls: serde_json::Value },
-    ToolResult { session_id: u64, content: String },
+    Delta { session_id: String, delta: String },
+    Done { session_id: String },
+    SystemNote { session_id: String, note: String },
+    ToolStatus { session_id: String, status: String },
+    ToolCalls { session_id: String, calls: serde_json::Value },
+    ToolResult { session_id: String, content: String },
     BoardUpdate { board: serde_json::Value },
-    Error { session_id: u64, err: String },
+    Error { session_id: String, err: String },
 }

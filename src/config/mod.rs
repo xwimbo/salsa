@@ -10,6 +10,7 @@ pub struct Config {
     pub user_name: String,
     pub assistant_name: String,
     pub default_model: String,
+    pub global_prompt: String,
 }
 
 impl Default for Config {
@@ -18,6 +19,7 @@ impl Default for Config {
             user_name: "<USERNAME>".into(),
             assistant_name: "assistant".into(),
             default_model: "gpt-5.3-codex".into(),
+            global_prompt: "You are a helpful assistant with specialized coding skillsets. Focus on clean code, idiomatic patterns, and efficient logic.".into(),
         }
     }
 }

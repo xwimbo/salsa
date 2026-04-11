@@ -31,7 +31,7 @@ impl CodexClient {
         &self,
         auth: &CodexAuth,
         body: &Value,
-        session_id: u64,
+        session_id: String,
         tx: &Sender<WorkerEvent>,
     ) -> Result<(String, Vec<ToolCall>)> {
         let mut tool_calls = Vec::new();
@@ -63,7 +63,7 @@ impl CodexClient {
             let line = line?;
             if line.is_empty() {
                 if !data.is_empty() {
-                    let done = dispatch_sse_event(&data, session_id, tx, &mut tool_calls, &mut text_acc)
+                    let done = dispatch_sse_event(&data, session_id.clone(), tx, &mut tool_calls, &mut text_acc)
                         .map_err(|e| anyhow!(e))?;
                     data.clear();
                     if done { break; }
@@ -74,7 +74,7 @@ impl CodexClient {
                 let rest = rest.strip_prefix(' ').unwrap_or(rest);
                 if !data.is_empty() {
                     if rest.trim().starts_with('{') {
-                         let done = dispatch_sse_event(&data, session_id, tx, &mut tool_calls, &mut text_acc)
+                         let done = dispatch_sse_event(&data, session_id.clone(), tx, &mut tool_calls, &mut text_acc)
                             .map_err(|e| anyhow!(e))?;
                          data.clear();
                          if done { break; }
@@ -119,7 +119,7 @@ fn find_tool_calls(v: &Value, calls: &mut Vec<ToolCall>) {
 
 fn dispatch_sse_event(
     data: &str,
-    session_id: u64,
+    session_id: String,
     tx: &Sender<WorkerEvent>,
     tool_calls: &mut Vec<ToolCall>,
     text_acc: &mut String,
@@ -154,7 +154,7 @@ fn dispatch_sse_event(
                               if text_acc.is_empty() {
                                   text_acc.push_str(text);
                                   let _ = tx.send(WorkerEvent::Delta {
-                                      session_id,
+                                      session_id: session_id.clone(),
                                       delta: text.to_string(),
                                   });
                               }

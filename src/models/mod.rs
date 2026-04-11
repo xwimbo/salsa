@@ -19,7 +19,7 @@ pub struct Message {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
-    pub id: u64,
+    pub id: String,
     pub title: String,
     pub messages: Vec<Message>,
     #[serde(skip)]
@@ -40,8 +40,8 @@ pub struct Board {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Project {
+    pub id: String,
     pub name: String,
-    pub sessions: Vec<Session>,
     pub board: Board,
-    pub next_session_id: u64,
+    pub prompt: Option<String>,
 }

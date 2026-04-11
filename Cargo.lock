@@ -1664,6 +1664,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tui-tabs",
+ "uuid",
 ]
 
 [[package]]
@@ -2253,6 +2254,7 @@ dependencies = [
  "atomic",
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

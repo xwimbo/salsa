@@ -78,7 +78,12 @@ impl App {
                 } else {
                     Style::default().fg(theme::FG)
                 };
-                frame.render_widget(Paragraph::new(format!(" {}", project.name)).style(style), rect);
+                
+                let mut display_name = if project.name.len() > 15 { format!("{}…", &project.name[..14]) } else { project.name.clone() };
+                if self.renaming_project == Some(idx) {
+                    display_name = format!("*{}", display_name);
+                }
+                frame.render_widget(Paragraph::new(format!(" {}", display_name)).style(style), rect);
                 self.project_hits.push((rect, idx + 1));
                 y += 1;
             }
@@ -127,7 +132,11 @@ impl App {
                 } else {
                     Style::default().fg(theme::FG)
                 };
-                frame.render_widget(Paragraph::new(format!(" {}", session.title)).style(style), rect);
+                let mut display_title = session.title.chars().take(6).collect::<String>();
+                if self.renaming_session == Some(idx) {
+                    display_title = format!("*{}", display_title);
+                }
+                frame.render_widget(Paragraph::new(format!(" {}", display_title)).style(style), rect);
                 self.session_hits.push((rect, idx));
                 y += 1;
             }
@@ -144,6 +153,34 @@ impl App {
             };
             frame.render_widget(Paragraph::new(" + New Session...").style(ns), nr);
             self.session_hits.push((nr, self.sessions.len()));
+        }
+        if self.selecting_prompt {
+            let overlay = Rect {
+                x: area.x + 10,
+                y: area.y + 5,
+                width: area.width.saturating_sub(20),
+                height: area.height.saturating_sub(10),
+            };
+            frame.render_widget(Clear, overlay);
+            let title = if let Some(id) = &self.active_project_id { 
+                let name = self.projects.iter().find(|p| p.id == *id).map(|p| p.name.as_str()).unwrap_or("?");
+                format!("Project Prompt: {}", name) 
+            } else { "Global Prompt".to_string() };
+            let block = Block::default()
+                .title(format!(" {} ", title))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::ORANGE));
+            let inner = block.inner(overlay);
+            frame.render_widget(block, overlay);
+            
+            let prompt_text = if let Some(id) = &self.active_project_id {
+                self.projects.iter().find(|p| p.id == *id).and_then(|p| p.prompt.as_deref()).unwrap_or(&self.global_prompt)
+            } else {
+                &self.global_prompt
+            };
+            
+            frame.render_widget(Paragraph::new(prompt_text).wrap(Wrap { trim: false }), inner);
         }
     }
 
@@ -180,19 +217,59 @@ impl App {
             self.menu_hits.push((rect, *action));
             x += width + 1;
         }
-        let project_prefix = if let Some(idx) = self.active_project {
-            format!("project: {}  •  ", self.projects[idx].name)
+        let project_prefix = if let Some(id) = &self.active_project_id {
+            let name = self.projects.iter().find(|p| p.id == *id).map(|p| p.name.as_str()).unwrap_or("?");
+            format!("project: {}  •  ", name)
         } else {
-            String::new()
+            "global  •  ".to_string()
         };
+        let workspace_path = config::tilde_path(&self.current_workspace);
         let status = format!(
             "{}mode: {}  •  workspace: {}",
             project_prefix,
             self.provider_label,
-            config::tilde_path(&self.current_workspace)
+            workspace_path
         );
-        let status_width = status.chars().count() as u16;
-        if status_width + 1 < area.width && x + status_width + 1 < area.x + area.width {
+        let mut status_width = status.chars().count() as u16;
+        let available_status_width = area.width.saturating_sub(x - area.x + 2);
+        
+        if status_width > available_status_width && available_status_width > 10 {
+            // Truncate workspace path more aggressively
+            let truncated_workspace = if workspace_path.len() > 10 {
+                format!("…{}", &workspace_path[workspace_path.len().saturating_sub(8)..])
+            } else {
+                workspace_path.clone()
+            };
+            let mut new_status = format!(
+                "{}mode: {}  •  ws: {}",
+                project_prefix,
+                self.provider_label,
+                truncated_workspace
+            );
+            status_width = new_status.chars().count() as u16;
+            
+            // If still too long, drop the prefix if we must, but try to keep it
+            if status_width > available_status_width {
+                 new_status = format!("{} • ws: {}", self.provider_label, truncated_workspace);
+                 status_width = new_status.chars().count() as u16;
+            }
+
+            if status_width <= available_status_width {
+                let status_rect = Rect {
+                    x: area.x + area.width - status_width - 1,
+                    y: area.y,
+                    width: status_width,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        new_status,
+                        Style::new().fg(theme::MUTED).bg(theme::BG_ALT),
+                    ))),
+                    status_rect,
+                );
+            }
+        } else if status_width <= available_status_width {
             let status_rect = Rect {
                 x: area.x + area.width - status_width - 1,
                 y: area.y,
@@ -223,7 +300,11 @@ impl App {
             let mut active_fits = false;
             if i > 0 { w_total += 3; } // for «
             for j in i..self.sessions.len() {
-                let w = self.sessions[j].title.chars().count() as u16 + 4;
+                let mut display_title = self.sessions[j].title.chars().take(6).collect::<String>();
+                if self.renaming_session == Some(j) {
+                    display_title = format!("*{}", display_title);
+                }
+                let w = display_title.chars().count() as u16 + 4;
                 let next_indicator_w = if j < self.sessions.len() - 1 { 3 } else { 0 };
                 if w_total + w + next_indicator_w > max_width {
                     break;
@@ -248,7 +329,11 @@ impl App {
 
         let mut last_rendered_idx = start_idx;
         for i in start_idx..self.sessions.len() {
-            let w = self.sessions[i].title.chars().count() as u16 + 4;
+            let mut display_title = self.sessions[i].title.chars().take(6).collect::<String>();
+            if self.renaming_session == Some(i) {
+                display_title = format!("*{}", display_title);
+            }
+            let w = display_title.chars().count() as u16 + 4;
             let next_indicator_w = if i < self.sessions.len() - 1 { 3 } else { 0 };
             if x_offset + w + next_indicator_w > max_width {
                 break;
@@ -279,7 +364,7 @@ impl App {
                 .border_type(BorderType::Rounded)
                 .border_style(border_style);
             
-            frame.render_widget(Paragraph::new(format!(" {} ", self.sessions[i].title)).block(block).style(style), rect);
+            frame.render_widget(Paragraph::new(format!(" {} ", display_title)).block(block).style(style), rect);
             
             x_offset += w;
             last_rendered_idx = i;

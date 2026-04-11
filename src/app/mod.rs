@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
@@ -13,12 +13,13 @@ use crate::config::{Config, Paths};
 use crate::models::{Project, Session, Message, Role, Board};
 use serde_json;
 use serde_yaml;
+use uuid::Uuid;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MenuAction {
     Settings,
     Sessions,
-    Agent,
+    Prompt,
     Projects,
     Help,
     Quit,
@@ -28,7 +29,7 @@ impl MenuAction {
     pub const ALL: &'static [(&'static str, MenuAction)] = &[
         ("Settings", MenuAction::Settings),
         ("Sessions", MenuAction::Sessions),
-        ("Agent", MenuAction::Agent),
+        ("Prompt", MenuAction::Prompt),
         ("Projects", MenuAction::Projects),
         ("Help", MenuAction::Help),
         ("Quit", MenuAction::Quit),
@@ -39,15 +40,17 @@ pub struct App {
     pub(crate) running: bool,
     pub(crate) sessions: Vec<Session>,
     pub(crate) projects: Vec<Project>,
-    pub(crate) active_project: Option<usize>,
-    pub(crate) next_session_id: u64,
+    pub(crate) active_project_id: Option<String>,
+    pub(crate) active_session_id: Option<String>,
     pub(crate) active_tab: usize,
     pub(crate) user_name: String,
     pub(crate) assistant_name: String,
     pub(crate) default_model: String,
+    pub(crate) global_prompt: String,
     pub(crate) paths: Paths,
     pub(crate) auth: CodexAuth,
     pub(crate) current_workspace: PathBuf,
+    pub(crate) current_sessions_path: PathBuf,
 
     pub(crate) worker_tx: Sender<WorkerCmd>,
     pub(crate) worker_rx: Receiver<WorkerEvent>,
@@ -56,6 +59,9 @@ pub struct App {
     pub(crate) tool_status: Option<String>,
     pub(crate) selecting_project: bool,
     pub(crate) selecting_session: bool,
+    pub(crate) selecting_prompt: bool,
+    pub(crate) renaming_session: Option<usize>,
+    pub(crate) renaming_project: Option<usize>,
 
     // Interaction state, refreshed each frame by render_*.
     pub(crate) menu_hits: Vec<(Rect, MenuAction)>,
@@ -74,13 +80,15 @@ impl App {
             running: true,
             sessions: Vec::new(),
             projects: Vec::new(),
-            active_project: None,
-            next_session_id: 1,
+            active_project_id: None,
+            active_session_id: None,
             active_tab: 0,
             user_name: config.user_name,
             assistant_name: config.assistant_name,
             default_model: config.default_model,
+            global_prompt: config.global_prompt,
             current_workspace: paths.workspace.clone(),
+            current_sessions_path: paths.sessions.clone(),
             paths,
             auth,
             worker_tx: worker.cmd_tx,
@@ -90,6 +98,9 @@ impl App {
             tool_status: None,
             selecting_project: false,
             selecting_session: false,
+            selecting_prompt: false,
+            renaming_session: None,
+            renaming_project: None,
             menu_hits: Vec::new(),
             tab_hits: Vec::new(),
             project_hits: Vec::new(),
@@ -104,42 +115,52 @@ impl App {
         app.load_projects().ok();
 
         if app.sessions.is_empty() {
+            let id = Uuid::new_v4().to_string();
             app.sessions.push(Session {
-                id: 1,
+                id: id.clone(),
                 title: "chat 1".into(),
                 messages: Vec::new(),
                 input: String::new(),
                 pending: false,
                 scroll: 0,
             });
-            app.next_session_id = 2;
+            app.active_session_id = Some(id);
+        } else {
+            app.active_session_id = app.sessions.first().map(|s| s.id.clone());
         }
 
         app
     }
 
     pub fn load_sessions(&mut self) -> Result<()> {
-        let dir = &self.paths.sessions;
+        let dir = &self.current_sessions_path;
         self.sessions.clear();
-        self.next_session_id = 1;
         if !dir.exists() { return Ok(()); }
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("yaml") {
                 let text = fs::read_to_string(&path)?;
-                let session: Session = serde_yaml::from_str(&text)?;
-                self.next_session_id = self.next_session_id.max(session.id + 1);
-                self.sessions.push(session);
+                if let Ok(session) = serde_yaml::from_str::<Session>(&text) {
+                    self.sessions.push(session);
+                }
             }
         }
-        self.sessions.sort_by_key(|s| s.id);
+        self.sessions.sort_by(|a, b| a.title.cmp(&b.title));
+        
+        // Sync active_tab with active_session_id if possible
+        if let Some(id) = &self.active_session_id {
+            if let Some(idx) = self.sessions.iter().position(|s| s.id == *id) {
+                self.active_tab = idx;
+            }
+        }
         Ok(())
     }
 
     pub fn save_active_session(&self) -> Result<()> {
         if let Some(session) = self.sessions.get(self.active_tab) {
-            let path = self.paths.sessions.join(format!("{}.yaml", session.title));
+            fs::create_dir_all(&self.current_sessions_path)?;
+            let path = self.current_sessions_path.join(format!("{}.yaml", session.id));
             let text = serde_yaml::to_string(session)?;
             fs::write(path, text)?;
         }
@@ -157,50 +178,71 @@ impl App {
                 let project_file = path.join("project.yaml");
                 if project_file.exists() {
                     let text = fs::read_to_string(&project_file)?;
-                    let project: Project = serde_yaml::from_str(&text)?;
-                    self.projects.push(project);
+                    if let Ok(project) = serde_yaml::from_str::<Project>(&text) {
+                        self.projects.push(project);
+                    }
                 }
+            }
+        }
+        self.projects.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(())
+    }
+
+    pub fn save_active_project(&mut self) -> Result<()> {
+        if let Some(id) = &self.active_project_id {
+            if let Some(project) = self.projects.iter_mut().find(|p| p.id == *id) {
+                let dir = self.paths.projects.join(&project.id);
+                fs::create_dir_all(dir.join("workspace"))?;
+                fs::create_dir_all(dir.join("sessions"))?;
+                let path = dir.join("project.yaml");
+                let text = serde_yaml::to_string(project)?;
+                fs::write(path, text)?;
+                self.save_active_session().ok();
             }
         }
         Ok(())
     }
 
-    pub fn save_active_project(&mut self) -> Result<()> {
-        if let Some(idx) = self.active_project {
-            let project = self.projects.get_mut(idx).context("active project not found")?;
-            project.sessions = self.sessions.clone();
-            project.next_session_id = self.next_session_id;
-            let dir = self.paths.projects.join(&project.name);
-            fs::create_dir_all(dir.join("workspace"))?;
-            let path = dir.join("project.yaml");
-            let text = serde_yaml::to_string(project)?;
-            fs::write(path, text)?;
-        }
-        Ok(())
-    }
-
-    pub fn switch_project(&mut self, idx: Option<usize>) -> Result<()> {
-        if self.active_project.is_some() { self.save_active_project().ok(); }
+    pub fn switch_project(&mut self, id: Option<String>) -> Result<()> {
+        if self.active_project_id.is_some() { self.save_active_project().ok(); }
         else { self.save_active_session().ok(); }
 
-        self.active_project = idx;
+        self.active_project_id = id;
         self.sessions.clear();
         self.active_tab = 0;
+        self.active_session_id = None;
+        
+        // Reset UI states
+        self.selecting_project = false;
+        self.selecting_session = false;
+        self.selecting_prompt = false;
+        self.renaming_session = None;
+        self.renaming_project = None;
 
-        let workspace = if let Some(idx) = idx {
-            let project = &self.projects[idx];
-            self.sessions = project.sessions.clone();
-            self.next_session_id = project.next_session_id;
-            self.paths.projects.join(&project.name).join("workspace")
+        let (workspace, sessions_path) = if let Some(id) = &self.active_project_id {
+            let project_dir = self.paths.projects.join(id);
+            (project_dir.join("workspace"), project_dir.join("sessions"))
         } else {
-            self.load_sessions().ok();
-            self.paths.workspace.clone()
+            (self.paths.workspace.clone(), self.paths.sessions.clone())
         };
 
         self.current_workspace = workspace.clone();
+        self.current_sessions_path = sessions_path;
+        self.load_sessions().ok();
+
         if self.sessions.is_empty() {
-            self.sessions.push(Session { id: 1, title: "chat 1".into(), messages: Vec::new(), input: String::new(), pending: false, scroll: 0 });
-            self.next_session_id = 2;
+            let session_id = Uuid::new_v4().to_string();
+            self.sessions.push(Session { 
+                id: session_id.clone(), 
+                title: "chat 1".into(), 
+                messages: Vec::new(), 
+                input: String::new(), 
+                pending: false, 
+                scroll: 0 
+            });
+            self.active_session_id = Some(session_id);
+        } else {
+            self.active_session_id = self.sessions.first().map(|s| s.id.clone());
         }
 
         let canon_workspace = fs::canonicalize(&workspace).unwrap_or(workspace);
@@ -210,46 +252,71 @@ impl App {
     }
 
     pub fn new_project(&mut self) -> Result<()> {
-        let name = format!("project-{}", self.projects.len() + 1);
+        let id = Uuid::new_v4().to_string();
+        let name = format!("proj-{}", &id[..4]);
         self.tool_status = Some(format!("Creating {}...", name));
         let project = Project {
+            id: id.clone(),
             name: name.clone(),
-            sessions: vec![Session { id: 1, title: "chat 1".into(), messages: Vec::new(), input: String::new(), pending: false, scroll: 0 }],
             board: Board::default(),
-            next_session_id: 2,
+            prompt: None,
         };
-        let dir = self.paths.projects.join(&name);
+        let dir = self.paths.projects.join(&id);
         fs::create_dir_all(dir.join("workspace"))?;
+        fs::create_dir_all(dir.join("sessions"))?;
         let path = dir.join("project.yaml");
         let text = serde_yaml::to_string(&project)?;
         fs::write(path, text)?;
         self.projects.push(project);
-        let new_idx = self.projects.len() - 1;
-        self.switch_project(Some(new_idx))?;
+        self.switch_project(Some(id))?;
         self.tool_status = None;
         Ok(())
     }
 
     pub fn close_session(&mut self, idx: usize) {
-        if self.sessions.len() <= 1 { return; }
         self.sessions.remove(idx);
+        if self.sessions.is_empty() {
+            self.sessions.push(Session { 
+                id: Uuid::new_v4().to_string(), 
+                title: "chat 1".into(), 
+                messages: Vec::new(), 
+                input: String::new(), 
+                pending: false, 
+                scroll: 0 
+            });
+        }
         if self.active_tab >= self.sessions.len() {
             self.active_tab = self.sessions.len().saturating_sub(1);
         }
-        if self.active_project.is_some() { self.save_active_project().ok(); }
+        self.active_session_id = self.sessions.get(self.active_tab).map(|s| s.id.clone());
+        if self.active_project_id.is_some() { self.save_active_project().ok(); }
     }
 
     pub fn delete_session(&mut self, idx: usize) {
-        if self.sessions.len() <= 1 { return; }
         let session = self.sessions.remove(idx);
-        if self.active_project.is_none() {
-            let path = self.paths.sessions.join(format!("{}.yaml", session.title));
-            fs::remove_file(path).ok();
+        let path = self.current_sessions_path.join(format!("{}.yaml", session.id));
+        fs::remove_file(path).ok();
+        
+        if self.sessions.is_empty() {
+            let session_id = Uuid::new_v4().to_string();
+            self.sessions.push(Session { 
+                id: session_id.clone(), 
+                title: "chat 1".into(), 
+                messages: Vec::new(), 
+                input: String::new(), 
+                pending: false, 
+                scroll: 0 
+            });
+            self.active_session_id = Some(session_id);
         }
+        
         if self.active_tab >= self.sessions.len() {
             self.active_tab = self.sessions.len().saturating_sub(1);
         }
-        if self.active_project.is_some() { self.save_active_project().ok(); }
+        self.active_session_id = self.sessions.get(self.active_tab).map(|s| s.id.clone());
+        
+        if self.active_project_id.is_some() { self.save_active_project().ok(); }
+        else { self.save_active_session().ok(); }
     }
 
     pub fn new_session(&mut self) {
@@ -259,20 +326,104 @@ impl App {
             n += 1;
             title = format!("chat {}", n);
         }
-        let id = self.next_session_id;
-        self.next_session_id += 1;
-        self.sessions.push(Session { id, title: title.clone(), messages: Vec::new(), input: String::new(), pending: false, scroll: 0 });
+        let id = Uuid::new_v4().to_string();
+        self.sessions.push(Session { id: id.clone(), title: title.clone(), messages: Vec::new(), input: String::new(), pending: false, scroll: 0 });
         self.active_tab = self.sessions.len() - 1;
+        self.active_session_id = Some(id);
         self.selecting_session = false;
-        if self.active_project.is_some() { self.save_active_project().ok(); }
+        if self.active_project_id.is_some() { self.save_active_project().ok(); }
         else { self.save_active_session().ok(); }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press { return; }
+        
+        // Global escape from renaming/overlays
+        if key.code == KeyCode::Esc {
+            self.selecting_project = false;
+            self.selecting_session = false;
+            self.selecting_prompt = false;
+            self.renaming_session = None;
+            self.renaming_project = None;
+            return;
+        }
+
+        if let Some(idx) = self.renaming_session {
+            match key.code {
+                KeyCode::Enter | KeyCode::Esc => { self.renaming_session = None; if self.active_project_id.is_some() { self.save_active_project().ok(); } else { self.save_active_session().ok(); } }
+                KeyCode::Backspace => { if let Some(s) = self.sessions.get_mut(idx) { s.title.pop(); } }
+                KeyCode::Char(c) => { if let Some(s) = self.sessions.get_mut(idx) { s.title.push(c); } }
+                _ => {}
+            }
+            return;
+        }
+
+        if let Some(idx) = self.renaming_project {
+            match key.code {
+                KeyCode::Enter | KeyCode::Esc => { self.renaming_project = None; self.save_active_project().ok(); }
+                KeyCode::Backspace => { if let Some(p) = self.projects.get_mut(idx) { p.name.pop(); } }
+                KeyCode::Char(c) => { if let Some(p) = self.projects.get_mut(idx) { p.name.push(c); } }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.selecting_prompt {
+            match key.code {
+                KeyCode::Esc => { self.selecting_prompt = false; }
+                KeyCode::Enter => { 
+                    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+                        if let Some(id) = &self.active_project_id {
+                            let p = self.projects.iter_mut().find(|p| p.id == *id).unwrap();
+                            if p.prompt.is_none() { p.prompt = Some(self.global_prompt.clone()); }
+                            p.prompt.as_mut().unwrap().push('\n');
+                        } else {
+                            self.global_prompt.push('\n');
+                        }
+                    } else {
+                        self.selecting_prompt = false; 
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(id) = &self.active_project_id {
+                        let p = self.projects.iter_mut().find(|p| p.id == *id).unwrap();
+                        if p.prompt.is_none() { p.prompt = Some(self.global_prompt.clone()); }
+                        p.prompt.as_mut().unwrap().pop();
+                    } else {
+                        self.global_prompt.pop();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if let Some(id) = &self.active_project_id {
+                        let p = self.projects.iter_mut().find(|p| p.id == *id).unwrap();
+                        if p.prompt.is_none() { p.prompt = Some(self.global_prompt.clone()); }
+                        p.prompt.as_mut().unwrap().push(c);
+                    } else {
+                        self.global_prompt.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         match (key.code, key.modifiers) {
             (KeyCode::Tab, _) => { self.next_tab(); return; }
             (KeyCode::BackTab, _) => { self.prev_tab(); return; }
+            (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                if self.selecting_session {
+                    if let Some(idx) = self.hovered_session {
+                        if idx < self.sessions.len() { self.renaming_session = Some(idx); }
+                    }
+                } else if self.selecting_project {
+                    if let Some(idx) = self.hovered_project {
+                        if idx > 0 && idx <= self.projects.len() { self.renaming_project = Some(idx - 1); }
+                    }
+                } else {
+                    self.renaming_session = Some(self.active_tab);
+                }
+                return;
+            }
             _ => {}
         }
         if self.active_session_pending() { return; }
@@ -296,7 +447,7 @@ impl App {
         session.messages.push(Message { role: Role::User, body: text, tool_calls: None });
         session.messages.push(Message { role: Role::Assistant, body: String::new(), tool_calls: None });
         session.pending = true;
-        let session_id = session.id;
+        let session_id = session.id.clone();
         let mut messages: Vec<ProviderMessage> = session.messages.iter()
             .filter(|m| !(matches!(m.role, Role::Assistant) && m.body.is_empty() && m.tool_calls.is_none()))
             .map(|m| ProviderMessage { 
@@ -305,10 +456,18 @@ impl App {
                 tool_calls: m.tool_calls.clone() 
             }).collect();
         messages.retain(|m| !m.content.is_empty() || matches!(m.role, Role::Assistant) || m.tool_calls.is_some());
-        let board = self.active_project.and_then(|idx| self.projects.get(idx).map(|p| serde_json::to_value(&p.board).unwrap()));
-        let request = ProviderRequest { messages, model: self.default_model.clone(), board };
+        
+        let board = self.active_project_id.as_ref().and_then(|id| self.projects.iter().find(|p| p.id == *id).map(|p| serde_json::to_value(&p.board).unwrap()));
+        
+        let custom_prompt = if let Some(id) = &self.active_project_id {
+            self.projects.iter().find(|p| p.id == *id).and_then(|p| p.prompt.clone()).or(Some(self.global_prompt.clone()))
+        } else {
+            Some(self.global_prompt.clone())
+        };
+
+        let request = ProviderRequest { messages, model: self.default_model.clone(), board, custom_prompt };
         let _ = self.worker_tx.send(WorkerCmd::Send { session_id, request });
-        if self.active_project.is_some() { self.save_active_project().ok(); }
+        if self.active_project_id.is_some() { self.save_active_project().ok(); }
         else { self.save_active_session().ok(); }
         self.scroll_to_bottom();
     }
@@ -333,7 +492,7 @@ impl App {
                 }
                 WorkerEvent::Done { session_id } => {
                     if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) { s.pending = false; self.tool_status = None; self.scroll_to_bottom(); }
-                    if self.active_project.is_some() { self.save_active_project().ok(); }
+                    if self.active_project_id.is_some() { self.save_active_project().ok(); }
                     else { self.save_active_session().ok(); }
                 }
                 WorkerEvent::SystemNote { session_id, note } => { 
@@ -370,7 +529,7 @@ impl App {
                         self.scroll_to_bottom();
                     }
                 }
-                WorkerEvent::BoardUpdate { board } => { if let Some(idx) = self.active_project { if let Some(project) = self.projects.get_mut(idx) { if let Ok(new_board) = serde_json::from_value(board) { project.board = new_board; } } } }
+                WorkerEvent::BoardUpdate { board } => { if let Some(id) = &self.active_project_id { if let Some(project) = self.projects.iter_mut().find(|p| p.id == *id) { if let Ok(new_board) = serde_json::from_value(board) { project.board = new_board; } } } }
                 WorkerEvent::Error { session_id, err } => {
                     if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                         if let Some(last) = s.messages.last_mut() {
@@ -380,14 +539,19 @@ impl App {
                         s.pending = false; self.tool_status = None;
                         self.scroll_to_bottom();
                     }
-                    if self.active_project.is_some() { self.save_active_project().ok(); }
+                    if self.active_project_id.is_some() { self.save_active_project().ok(); }
                     else { self.save_active_session().ok(); }
                 }
             }
         }
     }
 
-    pub fn switch_session(&mut self, idx: usize) { self.active_tab = idx; self.selecting_session = false; self.scroll_to_bottom(); }
+    pub fn switch_session(&mut self, idx: usize) { 
+        self.active_tab = idx; 
+        self.active_session_id = self.sessions.get(idx).map(|s| s.id.clone());
+        self.selecting_session = false; 
+        self.scroll_to_bottom(); 
+    }
 
     pub fn handle_mouse(&mut self, me: MouseEvent) {
         let pos = Position::new(me.column, me.row);
@@ -395,27 +559,40 @@ impl App {
             MouseEventKind::Moved | MouseEventKind::Drag(_) => { self.hovered_menu = self.menu_hit(pos); self.hovered_project = self.project_hit(pos); self.hovered_session = self.session_hit(pos); }
             MouseEventKind::Down(btn) => {
                 if btn == MouseButton::Left {
-                    if let Some(action) = self.menu_hit(pos) { self.pressed_menu = Some(action); }
-                    if let Some(idx) = self.tab_hit(pos) { self.active_tab = idx; }
-                    if let Some(idx) = self.project_hit(pos) {
-                        if idx == 0 { let _ = self.switch_project(None); }
-                        else if idx == self.projects.len() + 1 { let _ = self.new_project(); }
-                        else { let _ = self.switch_project(Some(idx - 1)); }
-                        self.selecting_project = false;
+                    // Overlays first
+                    if self.selecting_project {
+                        if let Some(idx) = self.project_hit(pos) {
+                            if idx == 0 { let _ = self.switch_project(None); }
+                            else if idx == self.projects.len() + 1 { let _ = self.new_project(); }
+                            else { 
+                                let project_id = self.projects[idx - 1].id.clone();
+                                let _ = self.switch_project(Some(project_id)); 
+                            }
+                            self.selecting_project = false;
+                            return;
+                        }
                     }
                     if self.selecting_session {
                         if let Some(idx) = self.session_hit(pos) {
                             if idx == self.sessions.len() { self.new_session(); }
                             else { self.switch_session(idx); }
+                            return;
                         }
+                    }
+
+                    if let Some(action) = self.menu_hit(pos) { self.pressed_menu = Some(action); return; }
+                    if let Some(idx) = self.tab_hit(pos) { 
+                        self.active_tab = idx; 
+                        self.active_session_id = self.sessions.get(idx).map(|s| s.id.clone());
+                        return;
                     }
                 } else if btn == MouseButton::Right {
-                    if let Some(idx) = self.tab_hit(pos) { self.close_session(idx); }
                     if self.selecting_session {
                         if let Some(idx) = self.session_hit(pos) {
-                            if idx < self.sessions.len() { self.delete_session(idx); }
+                            if idx < self.sessions.len() { self.delete_session(idx); return; }
                         }
                     }
+                    if let Some(idx) = self.tab_hit(pos) { self.close_session(idx); return; }
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => { if let Some(pressed) = self.pressed_menu.take() { if self.menu_hit(pos) == Some(pressed) { self.fire_menu(pressed); } } }
@@ -433,14 +610,26 @@ impl App {
     pub fn fire_menu(&mut self, action: MenuAction) {
         match action {
             MenuAction::Quit => self.running = false,
-            MenuAction::Projects => { self.selecting_project = !self.selecting_project; if self.selecting_project { self.load_projects().ok(); } self.selecting_session = false; }
-            MenuAction::Sessions => { self.selecting_session = !self.selecting_session; if self.selecting_session { self.load_sessions().ok(); } self.selecting_project = false; }
+            MenuAction::Projects => { self.selecting_project = !self.selecting_project; if self.selecting_project { self.load_projects().ok(); } self.selecting_session = false; self.selecting_prompt = false; }
+            MenuAction::Sessions => { self.selecting_session = !self.selecting_session; if self.selecting_session { self.load_sessions().ok(); } self.selecting_project = false; self.selecting_prompt = false; }
+            MenuAction::Prompt => { self.selecting_prompt = !self.selecting_prompt; self.selecting_project = false; self.selecting_session = false; }
             _ => {}
         }
     }
 
-    pub fn next_tab(&mut self) { if !self.sessions.is_empty() { self.active_tab = (self.active_tab + 1) % self.sessions.len(); } }
-    pub fn prev_tab(&mut self) { if !self.sessions.is_empty() { let n = self.sessions.len(); self.active_tab = (self.active_tab + n - 1) % n; } }
+    pub fn next_tab(&mut self) { 
+        if !self.sessions.is_empty() { 
+            self.active_tab = (self.active_tab + 1) % self.sessions.len(); 
+            self.active_session_id = self.sessions.get(self.active_tab).map(|s| s.id.clone());
+        } 
+    }
+    pub fn prev_tab(&mut self) { 
+        if !self.sessions.is_empty() { 
+            let n = self.sessions.len(); 
+            self.active_tab = (self.active_tab + n - 1) % n; 
+            self.active_session_id = self.sessions.get(self.active_tab).map(|s| s.id.clone());
+        } 
+    }
 
     pub fn is_running(&self) -> bool { self.running }
 }
