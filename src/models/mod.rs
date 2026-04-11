@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Role {
@@ -12,6 +13,8 @@ pub enum Role {
 pub struct Message {
     pub role: Role,
     pub body: String,
+    #[serde(default)]
+    pub tool_calls: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

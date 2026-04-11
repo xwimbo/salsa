@@ -11,6 +11,8 @@ use crate::agent::provider::CodexProvider;
 use crate::auth::CodexAuth;
 use crate::config::{Config, Paths};
 use crate::models::{Project, Session, Message, Role, Board};
+use serde_json;
+use serde_yaml;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MenuAction {
@@ -201,7 +203,8 @@ impl App {
             self.next_session_id = 2;
         }
 
-        let provider = Box::new(CodexProvider::new(self.auth.clone(), workspace)?);
+        let canon_workspace = fs::canonicalize(&workspace).unwrap_or(workspace);
+        let provider = Box::new(CodexProvider::new(self.auth.clone(), canon_workspace)?);
         let _ = self.worker_tx.send(WorkerCmd::UpdateProvider { provider });
         Ok(())
     }
@@ -290,25 +293,30 @@ impl App {
         let text = session.input.trim().to_string();
         if text.is_empty() { return; }
         session.input.clear();
-        session.messages.push(Message { role: Role::User, body: text });
-        session.messages.push(Message { role: Role::Assistant, body: String::new() });
+        session.messages.push(Message { role: Role::User, body: text, tool_calls: None });
+        session.messages.push(Message { role: Role::Assistant, body: String::new(), tool_calls: None });
         session.pending = true;
         let session_id = session.id;
-        let mut messages: Vec<ProviderMessage> = session.messages.iter().filter(|m| !(matches!(m.role, Role::Assistant) && m.body.is_empty())).map(|m| ProviderMessage { role: m.role, content: m.body.clone() }).collect();
-        messages.retain(|m| !m.content.is_empty() || matches!(m.role, Role::Assistant));
+        let mut messages: Vec<ProviderMessage> = session.messages.iter()
+            .filter(|m| !(matches!(m.role, Role::Assistant) && m.body.is_empty() && m.tool_calls.is_none()))
+            .map(|m| ProviderMessage { 
+                role: m.role, 
+                content: m.body.clone(), 
+                tool_calls: m.tool_calls.clone() 
+            }).collect();
+        messages.retain(|m| !m.content.is_empty() || matches!(m.role, Role::Assistant) || m.tool_calls.is_some());
         let board = self.active_project.and_then(|idx| self.projects.get(idx).map(|p| serde_json::to_value(&p.board).unwrap()));
         let request = ProviderRequest { messages, model: self.default_model.clone(), board };
         let _ = self.worker_tx.send(WorkerCmd::Send { session_id, request });
         if self.active_project.is_some() { self.save_active_project().ok(); }
         else { self.save_active_session().ok(); }
+        self.scroll_to_bottom();
     }
 
     pub fn scroll_to_bottom(&mut self) {
         if let Some(session) = self.sessions.get_mut(self.active_tab) {
-            let mut lines_len = 0;
-            for msg in session.messages.iter() { lines_len += msg.body.lines().count() + 2; }
-            let max_scroll = lines_len.saturating_sub(1) as u16;
-            session.scroll = max_scroll;
+            // Very aggressive scroll to bottom. The UI will clamp it.
+            session.scroll = 9999;
         }
     }
 
@@ -317,8 +325,9 @@ impl App {
             match ev {
                 WorkerEvent::Delta { session_id, delta } => {
                     if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                        if let Some(last) = s.messages.last_mut() {
-                            if matches!(last.role, Role::Assistant) { last.body.push_str(&delta); self.scroll_to_bottom(); }
+                        if let Some(last_assistant) = s.messages.iter_mut().rev().find(|m| matches!(m.role, Role::Assistant)) {
+                            last_assistant.body.push_str(&delta);
+                            self.scroll_to_bottom();
                         }
                     }
                 }
@@ -327,16 +336,49 @@ impl App {
                     if self.active_project.is_some() { self.save_active_project().ok(); }
                     else { self.save_active_session().ok(); }
                 }
-                WorkerEvent::SystemNote { session_id, note } => { if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) { s.messages.push(Message { role: Role::System, body: note }); } }
+                WorkerEvent::SystemNote { session_id, note } => { 
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) { 
+                        if s.pending { self.tool_status = Some(note); }
+                    } 
+                }
                 WorkerEvent::ToolStatus { session_id, status } => { if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) { if s.pending { self.tool_status = Some(status); } } }
+                WorkerEvent::ToolCalls { session_id, calls } => {
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                        let mut updated = false;
+                        if let Some(last) = s.messages.last_mut() {
+                            if matches!(last.role, Role::Assistant) {
+                                // Only update if we don't have calls yet, or if the new calls have actual arguments
+                                let has_args = calls.as_array()
+                                    .map(|a| a.iter().any(|c| !c.pointer("/function/arguments").unwrap_or(&serde_json::Value::Null).is_null()))
+                                    .unwrap_or(false);
+                                
+                                if last.tool_calls.is_none() || has_args {
+                                    last.tool_calls = Some(calls.clone());
+                                    updated = true;
+                                }
+                            }
+                        }
+                        if !updated {
+                            s.messages.push(Message { role: Role::Assistant, body: String::new(), tool_calls: Some(calls) });
+                        }
+                        self.scroll_to_bottom();
+                    }
+                }
+                WorkerEvent::ToolResult { session_id, content } => {
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                        s.messages.push(Message { role: Role::ToolResult, body: content, tool_calls: None });
+                        self.scroll_to_bottom();
+                    }
+                }
                 WorkerEvent::BoardUpdate { board } => { if let Some(idx) = self.active_project { if let Some(project) = self.projects.get_mut(idx) { if let Ok(new_board) = serde_json::from_value(board) { project.board = new_board; } } } }
                 WorkerEvent::Error { session_id, err } => {
                     if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                         if let Some(last) = s.messages.last_mut() {
                             if matches!(last.role, Role::Assistant) && last.body.is_empty() { last.body = format!("[error] {}", err); }
-                            else { s.messages.push(Message { role: Role::Assistant, body: format!("[error] {}", err) }); }
+                            else { s.messages.push(Message { role: Role::Assistant, body: format!("[error] {}", err), tool_calls: None }); }
                         }
                         s.pending = false; self.tool_status = None;
+                        self.scroll_to_bottom();
                     }
                     if self.active_project.is_some() { self.save_active_project().ok(); }
                     else { self.save_active_session().ok(); }

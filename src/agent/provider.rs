@@ -4,6 +4,8 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
+use serde_json;
+use serde_yaml;
 
 use crate::agent::{ProviderRequest, WorkerEvent, ProviderMessage};
 use crate::api::codex::CodexClient;
@@ -90,12 +92,29 @@ impl Provider for CodexProvider {
         for _ in 0..8 {
             let input: Vec<serde_json::Value> = messages
                 .iter()
+                .filter(|m| !matches!(m.role, Role::System))
                 .map(|m| m.as_json())
                 .collect();
 
-            let mut instructions = String::new();
+            let mut instructions = String::from(
+                "You are an expert software engineer assistant with access to a sandboxed workspace.\n\
+                You must use your provided tools to interact with the file system or run commands.\n\
+                \n\
+                Available tools:\n\
+                - fs_read: Read a file\n\
+                - fs_write: Write/create a file\n\
+                - fs_list: List files in a directory\n\
+                - fs_edit: Edit a file (search and replace)\n\
+                - fs_delete: Delete a file\n\
+                - sh_run: Run a shell command\n\
+                - board_update: Update the project board state\n\
+                \n\
+                CRITICAL: Never lie about using a tool. If you need to perform an action, you MUST call the tool.\n\
+                Do not claim to have performed an action unless you have actually called the tool and received a successful result.\n\
+                Be concise, honest, and direct in your responses."
+            );
             if let Some(ref board) = request.board {
-                instructions = format!("Current Project Board State:\n{}", serde_yaml::to_string(board).unwrap_or_default());
+                instructions.push_str(&format!("\n\nCurrent Project Board State:\n{}", serde_yaml::to_string(board).unwrap_or_default()));
             }
 
             let body = serde_json::json!({
@@ -110,8 +129,8 @@ impl Provider for CodexProvider {
                 "stream": true,
             });
 
-            let tool_calls = match self.client.request(&self.auth, &body, session_id, tx) {
-                Ok(tc) => tc,
+            let (text_content, tool_calls) = match self.client.request(&self.auth, &body, session_id, tx) {
+                Ok(res) => res,
                 Err(e) => {
                     let _ = tx.send(WorkerEvent::Error {
                         session_id,
@@ -121,13 +140,46 @@ impl Provider for CodexProvider {
                 }
             };
 
-            if tool_calls.is_empty() {
+            // Deduplicate tool calls by ID, prioritizing those with non-null arguments
+            let mut calls_map: std::collections::HashMap<String, crate::api::codex::ToolCall> = std::collections::HashMap::new();
+            for tc in tool_calls {
+                let is_empty = tc.args.is_null() || (tc.args.is_object() && tc.args.as_object().unwrap().is_empty());
+                if !is_empty || !calls_map.contains_key(&tc.id) {
+                    calls_map.insert(tc.id.clone(), tc);
+                }
+            }
+            let unique_calls: Vec<_> = calls_map.into_values().collect();
+
+            if unique_calls.is_empty() {
+                // We've already emitted deltas during request(), so we just finish.
                 let _ = tx.send(WorkerEvent::Done { session_id });
                 return;
             }
 
+            let calls_json = serde_json::json!(unique_calls.iter().map(|tc| {
+                serde_json::json!({
+                    "id": tc.id,
+                    "function": {
+                        "name": tc.name,
+                        "arguments": tc.args
+                    }
+                })
+            }).collect::<Vec<_>>());
+
+            let _ = tx.send(WorkerEvent::ToolCalls {
+                session_id,
+                calls: calls_json.clone(),
+            });
+
+            // Update history with the assistant's response (text + tool calls)
+            messages.push(ProviderMessage {
+                role: Role::Assistant,
+                content: text_content,
+                tool_calls: Some(calls_json),
+            });
+
             let mut tool_outputs = Vec::new();
-            for call in tool_calls {
+            for call in unique_calls {
                 let slug = tools::tool_slug(&call.name, &call.args);
                 let _ = tx.send(WorkerEvent::SystemNote {
                     session_id,
@@ -157,13 +209,16 @@ impl Provider for CodexProvider {
                 }));
             }
 
+            let result_content = serde_json::to_string(&tool_outputs).unwrap();
+            let _ = tx.send(WorkerEvent::ToolResult {
+                session_id,
+                content: result_content.clone(),
+            });
+
             messages.push(ProviderMessage {
                 role: Role::ToolResult,
-                content: serde_json::to_string(&tool_outputs).unwrap(),
-            });
-            messages.push(ProviderMessage {
-                role: Role::Assistant,
-                content: String::new(),
+                content: result_content,
+                tool_calls: None,
             });
         }
 

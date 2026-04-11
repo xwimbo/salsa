@@ -298,10 +298,17 @@ impl App {
             .border_style(Style::default().fg(theme::BORDER));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let Some(session) = self.sessions.get(self.active_tab) else {
-            return;
+        
+        // Use a scope to get a copy of the scroll value to avoid borrowing issues later
+        let (current_session_scroll, active_tab) = {
+            let Some(session) = self.sessions.get(self.active_tab) else {
+                return;
+            };
+            (session.scroll, self.active_tab)
         };
+
         let mut lines: Vec<Line> = Vec::new();
+        let session = &self.sessions[active_tab];
         for (i, msg) in session.messages.iter().enumerate() {
             if i > 0 {
                 lines.push(Line::from(""));
@@ -312,11 +319,15 @@ impl App {
                         format!("{{ {} }}", self.user_name),
                         Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
                     )));
-                    for bl in msg.body.lines() {
-                        lines.push(Line::from(Span::styled(
-                            bl.to_string(),
-                            Style::default().fg(theme::FG),
-                        )));
+                    if msg.body.is_empty() {
+                        lines.push(Line::from(Span::styled("(empty message)", Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC))));
+                    } else {
+                        for bl in msg.body.lines() {
+                            lines.push(Line::from(Span::styled(
+                                bl.to_string(),
+                                Style::default().fg(theme::FG),
+                            )));
+                        }
                     }
                 }
                 Role::Assistant => {
@@ -326,30 +337,35 @@ impl App {
                             .fg(theme::ORANGE)
                             .add_modifier(Modifier::BOLD),
                     )));
+                    let mut has_text = false;
                     for bl in msg.body.lines() {
                         lines.push(Line::from(Span::styled(
                             bl.to_string(),
                             Style::default().fg(theme::FG),
                         )));
+                        has_text = true;
+                    }
+                    
+                    // Show tool indicators only if the session is still pending AND this is the last message
+                    let is_last_msg = i == session.messages.len() - 1;
+                    if session.pending && is_last_msg {
+                        if let Some(ref calls) = msg.tool_calls {
+                            if let Some(calls_arr) = calls.as_array() {
+                                for call in calls_arr {
+                                    let name = call.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or("?");
+                                    lines.push(Line::from(Span::styled(
+                                        format!("  ▸ tool: {}", name),
+                                        Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC),
+                                    )));
+                                }
+                            }
+                        } else if !has_text {
+                            lines.push(Line::from(Span::styled("  (thinking...)", Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC))));
+                        }
                     }
                 }
-                Role::System => {
-                    lines.push(Line::from(Span::styled(
-                        msg.body.clone(),
-                        Style::default().fg(theme::MUTED),
-                    )));
-                }
-                Role::ToolResult => {
-                    lines.push(Line::from(Span::styled(
-                        "tool output:",
-                        Style::default().fg(theme::MUTED).add_modifier(Modifier::BOLD),
-                    )));
-                    for bl in msg.body.lines() {
-                        lines.push(Line::from(Span::styled(
-                            bl.to_string(),
-                            Style::default().fg(theme::MUTED),
-                        )));
-                    }
+                Role::System | Role::ToolResult => {
+                    // Hidden in UI, these are internal turn state.
                 }
             }
         }
@@ -359,8 +375,24 @@ impl App {
             width: inner.width.saturating_sub(2),
             height: inner.height,
         };
-        let max_scroll = lines.len().saturating_sub(padded.height as usize) as u16;
-        let current_scroll = session.scroll.min(max_scroll);
+        let mut total_wrapped_height = 0;
+        let available_width = padded.width as usize;
+        if available_width > 0 {
+            for line in &lines {
+                let line_width = line.width();
+                if line_width == 0 {
+                    total_wrapped_height += 1;
+                } else {
+                    total_wrapped_height += (line_width + available_width - 1) / available_width;
+                }
+            }
+        } else {
+            total_wrapped_height = lines.len();
+        }
+
+        let max_scroll = total_wrapped_height.saturating_sub(padded.height as usize) as u16;
+        let current_scroll = current_session_scroll.min(max_scroll);
+        
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -368,7 +400,7 @@ impl App {
             padded,
         );
         let mut scroll_state = ScrollbarState::default()
-            .content_length(max_scroll as usize + padded.height as usize)
+            .content_length(total_wrapped_height)
             .position(current_scroll as usize);
         frame.render_stateful_widget(
             Scrollbar::default()
@@ -378,8 +410,12 @@ impl App {
             inner,
             &mut scroll_state,
         );
-        if let Some(s) = self.sessions.get_mut(self.active_tab) {
-            s.scroll = current_scroll;
+        
+        // ONLY update the session scroll if it was clamped, otherwise let handle_mouse/key own it
+        if let Some(s) = self.sessions.get_mut(active_tab) {
+            if s.scroll > max_scroll {
+                s.scroll = max_scroll;
+            }
         }
     }
 
