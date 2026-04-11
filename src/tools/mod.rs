@@ -1,63 +1,11 @@
+pub mod sandbox;
+
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
+pub use sandbox::Sandbox;
 use serde_json::{json, Value};
-
-pub struct Sandbox {
-    root: PathBuf,
-}
-
-impl Sandbox {
-    pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into();
-        fs::create_dir_all(&root)
-            .with_context(|| format!("creating sandbox root {}", root.display()))?;
-        let canon = fs::canonicalize(&root)
-            .with_context(|| format!("canonicalizing sandbox root {}", root.display()))?;
-        Ok(Self { root: canon })
-    }
-
-    /// Resolve a workspace-relative path. Refuses absolute paths, `..`
-    /// traversal, and symlink escapes.
-    pub fn resolve(&self, rel: &str) -> Result<PathBuf> {
-        let p = Path::new(rel);
-        if p.is_absolute() {
-            bail!("path must be relative to the workspace");
-        }
-        for comp in p.components() {
-            match comp {
-                Component::ParentDir => bail!("path cannot contain '..'"),
-                Component::Prefix(_) | Component::RootDir => bail!("invalid path"),
-                _ => {}
-            }
-        }
-        let joined = self.root.join(p);
-
-        // Canonicalize either the target or its nearest existing ancestor to
-        // defeat symlink-based escapes.
-        let check_base = if joined.exists() {
-            fs::canonicalize(&joined)
-                .with_context(|| format!("canonicalizing {}", joined.display()))?
-        } else {
-            let mut cursor: &Path = joined.as_path();
-            let existing = loop {
-                match cursor.parent() {
-                    Some(parent) if parent.exists() => break parent,
-                    Some(parent) => cursor = parent,
-                    None => bail!("path has no existing ancestor"),
-                }
-            };
-            fs::canonicalize(existing)
-                .with_context(|| format!("canonicalizing ancestor {}", existing.display()))?
-        };
-
-        if !check_base.starts_with(&self.root) {
-            bail!("path escapes workspace");
-        }
-        Ok(joined)
-    }
-}
 
 pub fn tool_specs() -> Vec<Value> {
     vec![
@@ -129,17 +77,48 @@ pub fn tool_specs() -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
+        json!({
+            "type": "function",
+            "name": "sh_run",
+            "description": "Execute a shell command in the sandboxed workspace. Returns stdout and stderr combined.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "board_update",
+            "description": "Update the project board with the latest vision, steps, and issues.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "vision": {"type": "string", "description": "The overall vision for the project."},
+                    "steps": {"type": "array", "items": {"type": "string"}, "description": "The remaining steps to complete the vision."},
+                    "completed_steps": {"type": "array", "items": {"type": "string"}, "description": "The steps that have been completed."},
+                    "issues": {"type": "array", "items": {"type": "string"}, "description": "Any current issues or blockers."}
+                },
+                "additionalProperties": false
+            }
+        }),
     ]
 }
 
 pub fn tool_slug(name: &str, args: &Value) -> String {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+    let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("?");
     match name {
         "fs_read" => format!("Using readTool to read file {}", path),
         "fs_list" => format!("Using listTool to list directory {}", path),
         "fs_write" => format!("Using writeTool to write file {}", path),
         "fs_edit" => format!("Using editTool to edit file {}", path),
         "fs_delete" => format!("Using deleteTool to delete file {}", path),
+        "sh_run" => format!("Using shellTool to run command: {}", command),
+        "board_update" => "Updating project board...".to_string(),
         other => format!("Using {} on {}", other, path),
     }
 }
@@ -214,6 +193,24 @@ pub fn execute_tool(sandbox: &Sandbox, name: &str, args: &Value) -> Result<Strin
             fs::remove_file(&abs).with_context(|| format!("deleting {}", path))?;
             Ok(format!("deleted {}", path))
         }
+        "sh_run" => {
+            let command = string_arg(args, "command")?;
+            let output = if cfg!(target_os = "windows") {
+                Command::new("cmd")
+                    .args(["/C", command])
+                    .current_dir(&sandbox.root)
+                    .output()?
+            } else {
+                Command::new("sh")
+                    .args(["-c", command])
+                    .current_dir(&sandbox.root)
+                    .output()?
+            };
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok(format!("{}{}", stdout, stderr))
+        }
+        "board_update" => Ok("Board updated successfully.".to_string()),
         _ => bail!("unknown tool: {}", name),
     }
 }

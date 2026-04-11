@@ -21,6 +21,15 @@ pub struct CodexAuth {
     pub account_id: Option<String>,
 }
 
+impl Default for CodexAuth {
+    fn default() -> Self {
+        Self {
+            access_token: String::new(),
+            account_id: None,
+        }
+    }
+}
+
 impl CodexAuth {
     pub fn load_from_disk() -> Result<Self> {
         let path = dirs::home_dir()
