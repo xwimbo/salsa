@@ -32,6 +32,8 @@ impl CodexClient {
         auth: &CodexAuth,
         body: &Value,
         session_id: String,
+        turn_id: String,
+        emit_text_events: bool,
         tx: &Sender<WorkerEvent>,
     ) -> Result<(String, Vec<ToolCall>)> {
         let mut tool_calls = Vec::new();
@@ -63,7 +65,7 @@ impl CodexClient {
             let line = line?;
             if line.is_empty() {
                 if !data.is_empty() {
-                    let done = dispatch_sse_event(&data, session_id.clone(), tx, &mut tool_calls, &mut text_acc)
+                    let done = dispatch_sse_event(&data, session_id.clone(), turn_id.clone(), emit_text_events, tx, &mut tool_calls, &mut text_acc)
                         .map_err(|e| anyhow!(e))?;
                     data.clear();
                     if done { break; }
@@ -74,7 +76,7 @@ impl CodexClient {
                 let rest = rest.strip_prefix(' ').unwrap_or(rest);
                 if !data.is_empty() {
                     if rest.trim().starts_with('{') {
-                         let done = dispatch_sse_event(&data, session_id.clone(), tx, &mut tool_calls, &mut text_acc)
+                         let done = dispatch_sse_event(&data, session_id.clone(), turn_id.clone(), emit_text_events, tx, &mut tool_calls, &mut text_acc)
                             .map_err(|e| anyhow!(e))?;
                          data.clear();
                          if done { break; }
@@ -88,7 +90,7 @@ impl CodexClient {
         
         // Final flush
         if !data.is_empty() {
-            dispatch_sse_event(&data, session_id, tx, &mut tool_calls, &mut text_acc).ok();
+            dispatch_sse_event(&data, session_id, turn_id, emit_text_events, tx, &mut tool_calls, &mut text_acc).ok();
         }
 
         Ok((text_acc, tool_calls))
@@ -120,6 +122,8 @@ fn find_tool_calls(v: &Value, calls: &mut Vec<ToolCall>) {
 fn dispatch_sse_event(
     data: &str,
     session_id: String,
+    turn_id: String,
+    emit_text_events: bool,
     tx: &Sender<WorkerEvent>,
     tool_calls: &mut Vec<ToolCall>,
     text_acc: &mut String,
@@ -139,10 +143,13 @@ fn dispatch_sse_event(
         "response.output_text.delta" | "response.text.delta" | "text.delta" => {
             if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
                 text_acc.push_str(delta);
-                let _ = tx.send(WorkerEvent::Delta {
-                    session_id,
-                    delta: delta.to_string(),
-                });
+                if emit_text_events {
+                    let _ = tx.send(WorkerEvent::Delta {
+                        session_id,
+                        turn_id,
+                        delta: delta.to_string(),
+                    });
+                }
             }
         }
         "output" => {
@@ -153,10 +160,13 @@ fn dispatch_sse_event(
                          if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                               if text_acc.is_empty() {
                                   text_acc.push_str(text);
-                                  let _ = tx.send(WorkerEvent::Delta {
-                                      session_id: session_id.clone(),
-                                      delta: text.to_string(),
-                                  });
+                                  if emit_text_events {
+                                      let _ = tx.send(WorkerEvent::Delta {
+                                          session_id: session_id.clone(),
+                                          turn_id: turn_id.clone(),
+                                          delta: text.to_string(),
+                                      });
+                                  }
                               }
                          }
                      }

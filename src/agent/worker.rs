@@ -17,10 +17,11 @@ pub fn spawn_worker(mut provider: Box<dyn Provider>) -> WorkerHandles {
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
                 WorkerCmd::Send {
+                    turn_id,
                     session_id,
                     request,
                 } => {
-                    provider.generate(&request, session_id, &event_tx);
+                    provider.generate(&request, session_id, turn_id, &event_tx);
                 }
                 WorkerCmd::UpdateProvider { provider: new_provider } => {
                     provider = new_provider;

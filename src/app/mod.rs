@@ -10,8 +10,9 @@ use crate::agent::{WorkerCmd, WorkerEvent, WorkerHandles, ProviderMessage, Provi
 use crate::agent::provider::CodexProvider;
 use crate::auth::CodexAuth;
 use crate::config::{Config, Paths};
-use crate::models::{Project, Session, Message, Role, Board};
-use serde_json;
+use crate::models::{
+    AgentPhase, Board, ExecutionArtifact, Message, Project, Role, Session, TurnStep, TurnStepStatus,
+};
 use serde_yaml;
 use uuid::Uuid;
 
@@ -75,6 +76,20 @@ pub struct App {
 }
 
 impl App {
+    fn make_session(id: String, title: String) -> Session {
+        Session {
+            id,
+            title,
+            messages: Vec::new(),
+            input: String::new(),
+            pending: false,
+            scroll: 0,
+            pending_turn_id: None,
+            pending_project_id: None,
+            turn_steps: Vec::new(),
+        }
+    }
+
     pub fn new(config: Config, paths: Paths, worker: WorkerHandles, auth: CodexAuth) -> Self {
         let mut app = Self {
             running: true,
@@ -116,14 +131,7 @@ impl App {
 
         if app.sessions.is_empty() {
             let id = Uuid::new_v4().to_string();
-            app.sessions.push(Session {
-                id: id.clone(),
-                title: "chat 1".into(),
-                messages: Vec::new(),
-                input: String::new(),
-                pending: false,
-                scroll: 0,
-            });
+            app.sessions.push(Self::make_session(id.clone(), "chat 1".into()));
             app.active_session_id = Some(id);
         } else {
             app.active_session_id = app.sessions.first().map(|s| s.id.clone());
@@ -142,7 +150,7 @@ impl App {
             if path.extension().and_then(|s| s.to_str()) == Some("yaml") {
                 let text = fs::read_to_string(&path)?;
                 if let Ok(session) = serde_yaml::from_str::<Session>(&text) {
-                    self.sessions.push(session);
+                    self.sessions.push(Self::compacted_session_snapshot(&session));
                 }
             }
         }
@@ -161,7 +169,7 @@ impl App {
         if let Some(session) = self.sessions.get(self.active_tab) {
             fs::create_dir_all(&self.current_sessions_path)?;
             let path = self.current_sessions_path.join(format!("{}.yaml", session.id));
-            let text = serde_yaml::to_string(session)?;
+            let text = serde_yaml::to_string(&Self::compacted_session_snapshot(session))?;
             fs::write(path, text)?;
         }
         Ok(())
@@ -190,15 +198,20 @@ impl App {
 
     pub fn save_active_project(&mut self) -> Result<()> {
         if let Some(id) = &self.active_project_id {
-            if let Some(project) = self.projects.iter_mut().find(|p| p.id == *id) {
-                let dir = self.paths.projects.join(&project.id);
-                fs::create_dir_all(dir.join("workspace"))?;
-                fs::create_dir_all(dir.join("sessions"))?;
-                let path = dir.join("project.yaml");
-                let text = serde_yaml::to_string(project)?;
-                fs::write(path, text)?;
-                self.save_active_session().ok();
-            }
+            self.save_project_by_id(id)?;
+            self.save_active_session().ok();
+        }
+        Ok(())
+    }
+
+    fn save_project_by_id(&self, project_id: &str) -> Result<()> {
+        if let Some(project) = self.projects.iter().find(|p| p.id == project_id) {
+            let dir = self.paths.projects.join(&project.id);
+            fs::create_dir_all(dir.join("workspace"))?;
+            fs::create_dir_all(dir.join("sessions"))?;
+            let path = dir.join("project.yaml");
+            let text = serde_yaml::to_string(project)?;
+            fs::write(path, text)?;
         }
         Ok(())
     }
@@ -232,14 +245,8 @@ impl App {
 
         if self.sessions.is_empty() {
             let session_id = Uuid::new_v4().to_string();
-            self.sessions.push(Session { 
-                id: session_id.clone(), 
-                title: "chat 1".into(), 
-                messages: Vec::new(), 
-                input: String::new(), 
-                pending: false, 
-                scroll: 0 
-            });
+            self.sessions
+                .push(Self::make_session(session_id.clone(), "chat 1".into()));
             self.active_session_id = Some(session_id);
         } else {
             self.active_session_id = self.sessions.first().map(|s| s.id.clone());
@@ -276,14 +283,8 @@ impl App {
     pub fn close_session(&mut self, idx: usize) {
         self.sessions.remove(idx);
         if self.sessions.is_empty() {
-            self.sessions.push(Session { 
-                id: Uuid::new_v4().to_string(), 
-                title: "chat 1".into(), 
-                messages: Vec::new(), 
-                input: String::new(), 
-                pending: false, 
-                scroll: 0 
-            });
+            self.sessions
+                .push(Self::make_session(Uuid::new_v4().to_string(), "chat 1".into()));
         }
         if self.active_tab >= self.sessions.len() {
             self.active_tab = self.sessions.len().saturating_sub(1);
@@ -299,14 +300,8 @@ impl App {
         
         if self.sessions.is_empty() {
             let session_id = Uuid::new_v4().to_string();
-            self.sessions.push(Session { 
-                id: session_id.clone(), 
-                title: "chat 1".into(), 
-                messages: Vec::new(), 
-                input: String::new(), 
-                pending: false, 
-                scroll: 0 
-            });
+            self.sessions
+                .push(Self::make_session(session_id.clone(), "chat 1".into()));
             self.active_session_id = Some(session_id);
         }
         
@@ -327,7 +322,7 @@ impl App {
             title = format!("chat {}", n);
         }
         let id = Uuid::new_v4().to_string();
-        self.sessions.push(Session { id: id.clone(), title: title.clone(), messages: Vec::new(), input: String::new(), pending: false, scroll: 0 });
+        self.sessions.push(Self::make_session(id.clone(), title.clone()));
         self.active_tab = self.sessions.len() - 1;
         self.active_session_id = Some(id);
         self.selecting_session = false;
@@ -443,10 +438,14 @@ impl App {
         let Some(session) = self.sessions.get_mut(self.active_tab) else { return; };
         let text = session.input.trim().to_string();
         if text.is_empty() { return; }
+        let turn_id = Uuid::new_v4().to_string();
         session.input.clear();
         session.messages.push(Message { role: Role::User, body: text, tool_calls: None });
         session.messages.push(Message { role: Role::Assistant, body: String::new(), tool_calls: None });
         session.pending = true;
+        session.pending_turn_id = Some(turn_id.clone());
+        session.pending_project_id = self.active_project_id.clone();
+        session.turn_steps.clear();
         let session_id = session.id.clone();
         let mut messages: Vec<ProviderMessage> = session.messages.iter()
             .filter(|m| !(matches!(m.role, Role::Assistant) && m.body.is_empty() && m.tool_calls.is_none()))
@@ -457,7 +456,8 @@ impl App {
             }).collect();
         messages.retain(|m| !m.content.is_empty() || matches!(m.role, Role::Assistant) || m.tool_calls.is_some());
         
-        let board = self.active_project_id.as_ref().and_then(|id| self.projects.iter().find(|p| p.id == *id).map(|p| serde_json::to_value(&p.board).unwrap()));
+        let board = self.active_project_id.as_ref()
+            .and_then(|id| self.projects.iter().find(|p| p.id == *id).map(|p| p.board.clone()));
         
         let custom_prompt = if let Some(id) = &self.active_project_id {
             self.projects.iter().find(|p| p.id == *id).and_then(|p| p.prompt.clone()).or(Some(self.global_prompt.clone()))
@@ -465,8 +465,14 @@ impl App {
             Some(self.global_prompt.clone())
         };
 
-        let request = ProviderRequest { messages, model: self.default_model.clone(), board, custom_prompt };
-        let _ = self.worker_tx.send(WorkerCmd::Send { session_id, request });
+        let request = ProviderRequest {
+            messages,
+            model: self.default_model.clone(),
+            project_id: self.active_project_id.clone(),
+            board,
+            custom_prompt,
+        };
+        let _ = self.worker_tx.send(WorkerCmd::Send { turn_id, session_id, request });
         if self.active_project_id.is_some() { self.save_active_project().ok(); }
         else { self.save_active_session().ok(); }
         self.scroll_to_bottom();
@@ -479,68 +485,152 @@ impl App {
         }
     }
 
+    fn session_for_turn_mut(&mut self, session_id: &str, turn_id: &str) -> Option<&mut Session> {
+        self.sessions.iter_mut().find(|session| {
+            session.id == session_id && session.pending_turn_id.as_deref() == Some(turn_id)
+        })
+    }
+
+    fn finalize_session_turn(session: &mut Session) {
+        session.pending = false;
+        session.pending_turn_id = None;
+        session.pending_project_id = None;
+        *session = Self::compacted_session_snapshot(session);
+    }
+
+    fn compacted_session_snapshot(session: &Session) -> Session {
+        let mut snapshot = session.clone();
+        snapshot.pending = false;
+        snapshot.pending_turn_id = None;
+        snapshot.pending_project_id = None;
+        snapshot.turn_steps.clear();
+
+        for message in &mut snapshot.messages {
+            if matches!(message.role, Role::Assistant) {
+                message.tool_calls = None;
+            }
+        }
+
+        snapshot.messages.retain(|message| {
+            !matches!(message.role, Role::ToolResult)
+                && !(matches!(message.role, Role::Assistant) && message.body.trim().is_empty())
+        });
+        snapshot
+    }
+
+    fn save_after_event(&self, project_id: Option<&str>, session_id: &str) {
+        if let Some(project_id) = project_id {
+            self.save_project_by_id(project_id).ok();
+        } else if self.active_project_id.is_none()
+            && self
+                .sessions
+                .get(self.active_tab)
+                .map(|session| session.id.as_str() == session_id)
+                .unwrap_or(false)
+        {
+            self.save_active_session().ok();
+        }
+    }
+
     pub fn drain_worker_events(&mut self) {
         while let Ok(ev) = self.worker_rx.try_recv() {
             match ev {
-                WorkerEvent::Delta { session_id, delta } => {
-                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                WorkerEvent::Delta { session_id, turn_id, delta } => {
+                    if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
                         if let Some(last_assistant) = s.messages.iter_mut().rev().find(|m| matches!(m.role, Role::Assistant)) {
                             last_assistant.body.push_str(&delta);
                             self.scroll_to_bottom();
                         }
                     }
                 }
-                WorkerEvent::Done { session_id } => {
-                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) { s.pending = false; self.tool_status = None; self.scroll_to_bottom(); }
-                    if self.active_project_id.is_some() { self.save_active_project().ok(); }
-                    else { self.save_active_session().ok(); }
+                WorkerEvent::Done { session_id, turn_id } => {
+                    let mut project_to_save = None;
+                    if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
+                        project_to_save = s.pending_project_id.clone();
+                        Self::finalize_session_turn(s);
+                        self.tool_status = None;
+                        self.scroll_to_bottom();
+                    }
+                    self.save_after_event(project_to_save.as_deref(), &session_id);
                 }
-                WorkerEvent::SystemNote { session_id, note } => { 
-                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) { 
+                WorkerEvent::SystemNote { session_id, turn_id, note } => {
+                    if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
                         if s.pending { self.tool_status = Some(note); }
-                    } 
+                    }
                 }
-                WorkerEvent::ToolStatus { session_id, status } => { if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) { if s.pending { self.tool_status = Some(status); } } }
-                WorkerEvent::ToolCalls { session_id, calls } => {
-                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                        let mut updated = false;
-                        if let Some(last) = s.messages.last_mut() {
-                            if matches!(last.role, Role::Assistant) {
-                                // Only update if we don't have calls yet, or if the new calls have actual arguments
-                                let has_args = calls.as_array()
-                                    .map(|a| a.iter().any(|c| !c.pointer("/function/arguments").unwrap_or(&serde_json::Value::Null).is_null()))
-                                    .unwrap_or(false);
-                                
-                                if last.tool_calls.is_none() || has_args {
-                                    last.tool_calls = Some(calls.clone());
-                                    updated = true;
-                                }
+                WorkerEvent::ToolStatus { session_id, turn_id, status } => {
+                    if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
+                        if s.pending { self.tool_status = Some(status); }
+                    }
+                }
+                WorkerEvent::ToolCalls { session_id, turn_id, calls } => {
+                    if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
+                        if let Some(last_assistant) = s.messages.iter_mut().rev().find(|m| matches!(m.role, Role::Assistant)) {
+                            let has_args = calls.as_array()
+                                .map(|a| a.iter().any(|c| !c.pointer("/function/arguments").unwrap_or(&serde_json::Value::Null).is_null()))
+                                .unwrap_or(false);
+
+                            if last_assistant.tool_calls.is_none() || has_args {
+                                last_assistant.tool_calls = Some(calls);
                             }
                         }
-                        if !updated {
-                            s.messages.push(Message { role: Role::Assistant, body: String::new(), tool_calls: Some(calls) });
+                        self.scroll_to_bottom();
+                    }
+                }
+                WorkerEvent::ToolResult { session_id, turn_id, content } => {
+                    let _ = (session_id, turn_id, content);
+                }
+                WorkerEvent::PhaseChange { session_id, turn_id, phase } => {
+                    if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
+                        upsert_turn_step(
+                            &mut s.turn_steps,
+                            phase,
+                            TurnStepStatus::Running,
+                            None,
+                        );
+                        self.tool_status = Some(match phase {
+                            AgentPhase::Plan => "planning...".into(),
+                            AgentPhase::Explore => "exploring...".into(),
+                            AgentPhase::Act => "executing...".into(),
+                            AgentPhase::Verify => "verifying...".into(),
+                            AgentPhase::Respond => "responding...".into(),
+                        });
+                    }
+                }
+                WorkerEvent::StepUpdate { session_id, turn_id, phase, status, summary } => {
+                    if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
+                        upsert_turn_step(&mut s.turn_steps, phase, status, summary);
+                    }
+                }
+                WorkerEvent::StepArtifact { session_id, turn_id, phase, artifact } => {
+                    if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
+                        append_turn_artifact(&mut s.turn_steps, phase, artifact);
+                    }
+                }
+                WorkerEvent::BoardUpdate { session_id, turn_id, project_id, operations } => {
+                    if self.session_for_turn_mut(&session_id, &turn_id).is_none() {
+                        continue;
+                    }
+                    if let Some(project_id) = project_id {
+                        if let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) {
+                            project.board.apply_operations(&operations);
+                            self.save_project_by_id(&project_id).ok();
                         }
-                        self.scroll_to_bottom();
                     }
                 }
-                WorkerEvent::ToolResult { session_id, content } => {
-                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
-                        s.messages.push(Message { role: Role::ToolResult, body: content, tool_calls: None });
-                        self.scroll_to_bottom();
-                    }
-                }
-                WorkerEvent::BoardUpdate { board } => { if let Some(id) = &self.active_project_id { if let Some(project) = self.projects.iter_mut().find(|p| p.id == *id) { if let Ok(new_board) = serde_json::from_value(board) { project.board = new_board; } } } }
-                WorkerEvent::Error { session_id, err } => {
-                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                WorkerEvent::Error { session_id, turn_id, err } => {
+                    let mut project_to_save = None;
+                    if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
+                        project_to_save = s.pending_project_id.clone();
                         if let Some(last) = s.messages.last_mut() {
                             if matches!(last.role, Role::Assistant) && last.body.is_empty() { last.body = format!("[error] {}", err); }
                             else { s.messages.push(Message { role: Role::Assistant, body: format!("[error] {}", err), tool_calls: None }); }
                         }
-                        s.pending = false; self.tool_status = None;
+                        Self::finalize_session_turn(s);
+                        self.tool_status = None;
                         self.scroll_to_bottom();
                     }
-                    if self.active_project_id.is_some() { self.save_active_project().ok(); }
-                    else { self.save_active_session().ok(); }
+                    self.save_after_event(project_to_save.as_deref(), &session_id);
                 }
             }
         }
@@ -632,4 +722,44 @@ impl App {
     }
 
     pub fn is_running(&self) -> bool { self.running }
+}
+
+fn upsert_turn_step(
+    steps: &mut Vec<TurnStep>,
+    phase: AgentPhase,
+    status: TurnStepStatus,
+    summary: Option<String>,
+) {
+    if let Some(step) = steps.iter_mut().find(|step| step.phase == phase) {
+        step.status = status;
+        if let Some(summary) = summary {
+            step.summary = summary;
+        }
+        return;
+    }
+
+    steps.push(TurnStep {
+        phase,
+        status,
+        summary: summary.unwrap_or_default(),
+        artifacts: Vec::new(),
+    });
+}
+
+fn append_turn_artifact(
+    steps: &mut Vec<TurnStep>,
+    phase: AgentPhase,
+    artifact: ExecutionArtifact,
+) {
+    if let Some(step) = steps.iter_mut().find(|step| step.phase == phase) {
+        step.artifacts.push(artifact);
+        return;
+    }
+
+    steps.push(TurnStep {
+        phase,
+        status: TurnStepStatus::Running,
+        summary: String::new(),
+        artifacts: vec![artifact],
+    });
 }

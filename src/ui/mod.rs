@@ -9,7 +9,7 @@ use ratatui::Frame;
 
 use crate::app::{App, MenuAction};
 use crate::config;
-use crate::models::Role;
+use crate::models::{ExecutionArtifact, Role, TurnStepStatus};
 
 impl App {
     pub fn render(&mut self, frame: &mut Frame<'_>) {
@@ -524,12 +524,43 @@ impl App {
             height: inner.height,
         };
         if pending {
+            let session = self.sessions.get(self.active_tab);
+            let mut lines = Vec::new();
             let status = self.tool_status.as_deref().unwrap_or("thinking…");
+            lines.push(Line::from(Span::styled(
+                status,
+                Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC),
+            )));
+            if let Some(session) = session {
+                for step in session.turn_steps.iter().rev().take(3).rev() {
+                    let marker = match step.status {
+                        TurnStepStatus::Running => "›",
+                        TurnStepStatus::Completed => "•",
+                        TurnStepStatus::Failed => "!",
+                    };
+                    let phase = match step.phase {
+                        crate::models::AgentPhase::Plan => "plan",
+                        crate::models::AgentPhase::Explore => "explore",
+                        crate::models::AgentPhase::Act => "act",
+                        crate::models::AgentPhase::Verify => "verify",
+                        crate::models::AgentPhase::Respond => "respond",
+                    };
+                    let detail = if !step.summary.is_empty() {
+                        step.summary.as_str()
+                    } else {
+                        latest_artifact_label(step.artifacts.last())
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{marker} {phase}: "),
+                            Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(detail.to_string(), Style::default().fg(theme::FG)),
+                    ]));
+                }
+            }
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    status,
-                    Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC),
-                ))),
+                Paragraph::new(lines).wrap(Wrap { trim: false }),
                 padded,
             );
             return;
@@ -551,5 +582,15 @@ impl App {
             ])
         };
         frame.render_widget(Paragraph::new(line), padded);
+    }
+}
+
+fn latest_artifact_label(artifact: Option<&ExecutionArtifact>) -> &'static str {
+    match artifact {
+        Some(ExecutionArtifact::AssistantNote { .. }) => "thinking",
+        Some(ExecutionArtifact::ToolCall { .. }) => "calling tool",
+        Some(ExecutionArtifact::ToolResult { .. }) => "tool returned",
+        Some(ExecutionArtifact::BoardOps { .. }) => "board updated",
+        None => "in progress",
     }
 }
