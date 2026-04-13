@@ -1,18 +1,16 @@
 {
-    "name": "Rust Dev",
-    "image": "mcr.microsoft.com/devcontainers/universal:2",
+    "name": "Rust Minimal",
+    // Use the Debian-based slim image instead of the 'universal' monster
+    "image": "mcr.microsoft.com/devcontainers/base:debian",
     "features": {
         "ghcr.io/devcontainers/features/rust:1": {
-            "version": "latest",
-            "profile": "minimal"
+            "version": "latest"
         }
     },
     "customizations": {
         "vscode": {
             "extensions": [
-                "rust-lang.rust-analyzer",
-                "tamasfe.even-better-toml",
-                "serayuzgur.crates"
+                "rust-lang.rust-analyzer"
             ]
         }
     },
