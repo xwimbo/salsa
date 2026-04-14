@@ -721,6 +721,7 @@ impl App {
                 role: m.role,
                 content: m.body.clone(),
                 tool_calls: m.tool_calls.clone(),
+                attachments: Vec::new(),
             })
             .collect();
         messages.retain(|m| {

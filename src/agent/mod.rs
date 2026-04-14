@@ -10,39 +10,78 @@ use crate::models::{
 use serde_json;
 
 #[derive(Debug, Clone)]
+pub enum ProviderAttachment {
+    Image {
+        mime_type: String,
+        data_base64: String,
+    },
+    File {
+        mime_type: String,
+        filename: String,
+        data_base64: String,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct ProviderMessage {
     pub role: Role,
     pub content: String,
     pub tool_calls: Option<serde_json::Value>,
+    pub attachments: Vec<ProviderAttachment>,
 }
 
 impl ProviderMessage {
     pub fn as_json(&self) -> serde_json::Value {
+        let mut content = Vec::new();
         match self.role {
-            Role::User => serde_json::json!({
-                "role": "user",
-                "content": [{"type": "input_text", "text": self.content}],
-            }),
-            Role::Assistant => {
-                let mut content = Vec::new();
+            Role::User | Role::System | Role::ToolResult => {
                 if !self.content.is_empty() {
-                    content.push(serde_json::json!({"type": "output_text", "text": self.content}));
+                    content.push(serde_json::json!({
+                        "type": "input_text",
+                        "text": self.content
+                    }));
                 }
-                serde_json::json!({
-                    "role": "assistant",
-                    "content": content,
-                })
+                for attachment in &self.attachments {
+                    content.push(attachment.as_json());
+                }
             }
-            Role::System => serde_json::json!({
-                "role": "system",
-                "content": [{"type": "input_text", "text": self.content}],
+            Role::Assistant => {
+                if !self.content.is_empty() {
+                    content.push(serde_json::json!({
+                        "type": "output_text",
+                        "text": self.content
+                    }));
+                }
+            }
+        }
+
+        match self.role {
+            Role::User => serde_json::json!({ "role": "user", "content": content }),
+            Role::Assistant => serde_json::json!({ "role": "assistant", "content": content }),
+            Role::System | Role::ToolResult => serde_json::json!({ "role": "system", "content": content }),
+        }
+    }
+}
+
+impl ProviderAttachment {
+    fn as_json(&self) -> serde_json::Value {
+        match self {
+            ProviderAttachment::Image {
+                mime_type,
+                data_base64,
+            } => serde_json::json!({
+                "type": "input_image",
+                "image_url": format!("data:{};base64,{}", mime_type, data_base64),
             }),
-            Role::ToolResult => {
-                serde_json::json!({
-                    "role": "system",
-                    "content": [{"type": "input_text", "text": self.content}],
-                })
-            }
+            ProviderAttachment::File {
+                mime_type,
+                filename,
+                data_base64,
+            } => serde_json::json!({
+                "type": "input_file",
+                "filename": filename,
+                "file_data": format!("data:{};base64,{}", mime_type, data_base64),
+            }),
         }
     }
 }

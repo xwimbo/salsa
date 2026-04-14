@@ -475,6 +475,7 @@ fn run_specialist_loop(
                     role: Role::System,
                     content: frame.as_system_text(),
                     tool_calls: None,
+                    attachments: Vec::new(),
                 })
                 .collect();
             let input: Vec<serde_json::Value> = conversation
@@ -572,41 +573,53 @@ fn run_specialist_loop(
                         });
                     }
 
-                    let (output, board_ops) = tools::execute_tool(
+                    let execution = tools::execute_tool(
                         sandbox,
                         &call.name,
                         &call.args,
                         board.budgets.max_output_bytes,
                     );
-                    if !board_ops.is_empty() {
-                        board.apply_operations(&board_ops);
+                    if !execution.board_ops.is_empty() {
+                        board.apply_operations(&execution.board_ops);
                     }
                     tool_summaries.push(format!(
                         "tool={} args={} output={}",
                         call.name,
                         serde_json::to_string(&call.args).unwrap_or_default(),
-                        output
+                        execution.output
                     ));
                     continuation_artifacts.push(ExecutionArtifact::ToolResult {
                         tool_name: call.name.clone(),
-                        output: output.clone(),
+                        output: execution.output.clone(),
                     });
 
+                    if !execution.attachments.is_empty() {
+                        conversation.push(ProviderMessage {
+                            role: Role::ToolResult,
+                            content: format!(
+                                "Tool `{}` attached media from the workspace for inspection. Use the attachment directly when answering.",
+                                call.name
+                            ),
+                            tool_calls: None,
+                            attachments: execution.attachments.clone(),
+                        });
+                    }
+
                     if let Some((session_id, turn_id, tx)) = interactive_turn {
-                        if !board_ops.is_empty() {
+                        if !execution.board_ops.is_empty() {
                             let _ = tx.send(WorkerEvent::StepArtifact {
                                 session_id: session_id.to_string(),
                                 turn_id: turn_id.to_string(),
                                 phase,
                                 artifact: ExecutionArtifact::BoardOps {
-                                    operations: board_ops.clone(),
+                                    operations: execution.board_ops.clone(),
                                 },
                             });
                             let _ = tx.send(WorkerEvent::BoardUpdate {
                                 session_id: session_id.to_string(),
                                 turn_id: turn_id.to_string(),
                                 project_id: request.project_id.clone(),
-                                operations: board_ops,
+                                operations: execution.board_ops.clone(),
                             });
                         }
                         let _ = tx.send(WorkerEvent::StepArtifact {
@@ -615,7 +628,7 @@ fn run_specialist_loop(
                             phase,
                             artifact: ExecutionArtifact::ToolResult {
                                 tool_name: call.name.clone(),
-                                output: output.clone(),
+                                output: execution.output.clone(),
                             },
                         });
                     }
@@ -645,6 +658,7 @@ fn run_specialist_loop(
                         role: Role::Assistant,
                         content: text_content,
                         tool_calls: None,
+                        attachments: Vec::new(),
                     });
                 } else if !text_content.trim().is_empty() {
                     if let Some((session_id, turn_id, tx)) = interactive_turn {

@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod media;
 pub mod sandbox;
 
 use std::fs;
@@ -23,6 +24,9 @@ pub fn tool_slug(name: &str, args: &Value) -> String {
     if let Some(slug) = analysis::tool_slug(name, args) {
         return slug;
     }
+    if let Some(slug) = media::tool_slug(name, args) {
+        return slug;
+    }
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
     let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("?");
     match name {
@@ -42,45 +46,64 @@ pub fn execute_tool(
     name: &str,
     args: &Value,
     max_output_bytes: usize,
-) -> (String, Vec<BoardOperation>) {
+) -> media::ToolExecution {
     let result = match name {
-        "fs_read" => execute_fs_read(sandbox, args),
-        "fs_list" => execute_fs_list(sandbox, args),
-        "fs_write" => execute_fs_write(sandbox, args),
-        "fs_edit" => execute_fs_edit(sandbox, args),
-        "fs_delete" => execute_fs_delete(sandbox, args),
-        "sh_run" => execute_sh_run(sandbox, args),
-        "board_update" => execute_board_update(args),
+        "fs_read" => execute_fs_read(sandbox, args).map(tool_output_only),
+        "fs_list" => execute_fs_list(sandbox, args).map(tool_output_only),
+        "fs_write" => execute_fs_write(sandbox, args).map(tool_output_only),
+        "fs_edit" => execute_fs_edit(sandbox, args).map(tool_output_only),
+        "fs_delete" => execute_fs_delete(sandbox, args).map(tool_output_only),
+        "sh_run" => execute_sh_run(sandbox, args).map(tool_output_only),
+        "board_update" => execute_board_update(args).map(tool_output_only),
         "df_inspect" | "df_describe" | "df_filter" | "df_group_stats" | "df_value_counts"
-        | "df_correlation" => analysis::execute(sandbox, name, args).map(|output| (output, Vec::new())),
+        | "df_correlation" => analysis::execute(sandbox, name, args).map(|output| media::ToolExecution {
+            output,
+            board_ops: Vec::new(),
+            attachments: Vec::new(),
+        }),
+        "view_image" | "view_pdf" => media::execute(sandbox, name, args),
         _ => Err(anyhow!("unknown tool: {}", name)),
     };
 
     match result {
-        Ok((output, ops)) => (truncate_output(output, max_output_bytes), ops),
-        Err(err) => (format!("[error] {}", err), Vec::new()),
+        Ok(mut execution) => {
+            execution.output = truncate_output(execution.output, max_output_bytes);
+            execution
+        }
+        Err(err) => media::ToolExecution {
+            output: format!("[error] {}", err),
+            board_ops: Vec::new(),
+            attachments: Vec::new(),
+        },
     }
 }
 
 fn default_tool_specs_for_phase(phase: AgentPhase) -> Vec<Value> {
     match phase {
         AgentPhase::Plan => vec![board_update_spec()],
-        AgentPhase::Explore => vec![fs_read_spec(), fs_list_spec(), board_update_spec()],
-        AgentPhase::Act => vec![
-            fs_read_spec(),
-            fs_list_spec(),
-            fs_write_spec(),
-            fs_edit_spec(),
-            fs_delete_spec(),
-            sh_run_spec(),
-            board_update_spec(),
-        ],
-        AgentPhase::Verify => vec![
-            fs_read_spec(),
-            fs_list_spec(),
-            sh_run_spec(),
-            board_update_spec(),
-        ],
+        AgentPhase::Explore => {
+            let mut specs = vec![fs_read_spec(), fs_list_spec(), board_update_spec()];
+            specs.extend(media::tool_specs());
+            specs
+        }
+        AgentPhase::Act => {
+            let mut specs = vec![
+                fs_read_spec(),
+                fs_list_spec(),
+                fs_write_spec(),
+                fs_edit_spec(),
+                fs_delete_spec(),
+                sh_run_spec(),
+                board_update_spec(),
+            ];
+            specs.extend(media::tool_specs());
+            specs
+        }
+        AgentPhase::Verify => {
+            let mut specs = vec![fs_read_spec(), fs_list_spec(), sh_run_spec(), board_update_spec()];
+            specs.extend(media::tool_specs());
+            specs
+        }
         AgentPhase::Respond => Vec::new(),
     }
 }
@@ -91,6 +114,7 @@ fn analyst_tool_specs_for_phase(phase: AgentPhase) -> Vec<Value> {
         AgentPhase::Explore | AgentPhase::Act | AgentPhase::Verify => {
             let mut specs = vec![fs_read_spec(), fs_list_spec(), board_update_spec()];
             specs.extend(analysis::tool_specs());
+            specs.extend(media::tool_specs());
             specs
         }
         AgentPhase::Respond => Vec::new(),
@@ -210,6 +234,14 @@ fn truncate_output(mut output: String, max_output_bytes: usize) -> String {
     output.truncate(max_output_bytes);
     output.push_str("\n[truncated]");
     output
+}
+
+fn tool_output_only((output, board_ops): (String, Vec<BoardOperation>)) -> media::ToolExecution {
+    media::ToolExecution {
+        output,
+        board_ops,
+        attachments: Vec::new(),
+    }
 }
 
 fn string_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
