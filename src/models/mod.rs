@@ -34,6 +34,37 @@ pub struct Session {
     pub pending_project_id: Option<String>,
     #[serde(skip)]
     pub turn_steps: Vec<TurnStep>,
+    #[serde(default)]
+    pub jobs: Vec<BackgroundJob>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentKind {
+    Orchestrator,
+    Planner,
+    Coder,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackgroundJob {
+    pub id: String,
+    pub agent: AgentKind,
+    pub title: String,
+    pub status: JobStatus,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub summary: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

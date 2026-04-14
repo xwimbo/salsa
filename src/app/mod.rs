@@ -11,7 +11,8 @@ use crate::agent::provider::CodexProvider;
 use crate::auth::CodexAuth;
 use crate::config::{Config, Paths};
 use crate::models::{
-    AgentPhase, Board, ExecutionArtifact, Message, Project, Role, Session, TurnStep, TurnStepStatus,
+    AgentKind, AgentPhase, Board, ExecutionArtifact, JobStatus, Message, Project, Role, Session,
+    TurnStep, TurnStepStatus,
 };
 use serde_yaml;
 use uuid::Uuid;
@@ -19,7 +20,6 @@ use uuid::Uuid;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MenuAction {
     Settings,
-    Sessions,
     Prompt,
     Projects,
     Help,
@@ -29,7 +29,6 @@ pub enum MenuAction {
 impl MenuAction {
     pub const ALL: &'static [(&'static str, MenuAction)] = &[
         ("Settings", MenuAction::Settings),
-        ("Sessions", MenuAction::Sessions),
         ("Prompt", MenuAction::Prompt),
         ("Projects", MenuAction::Projects),
         ("Help", MenuAction::Help),
@@ -48,6 +47,13 @@ pub struct App {
     pub(crate) assistant_name: String,
     pub(crate) default_model: String,
     pub(crate) global_prompt: String,
+    pub(crate) show_jobs_pane: bool,
+    pub(crate) onboarding_complete: bool,
+    pub(crate) first_name: String,
+    pub(crate) last_name: String,
+    pub(crate) sid: String,
+    pub(crate) email: String,
+    pub(crate) api_key: String,
     pub(crate) paths: Paths,
     pub(crate) auth: CodexAuth,
     pub(crate) current_workspace: PathBuf,
@@ -61,21 +67,38 @@ pub struct App {
     pub(crate) selecting_project: bool,
     pub(crate) selecting_session: bool,
     pub(crate) selecting_prompt: bool,
+    pub(crate) selecting_settings: bool,
+    pub(crate) editing_profile: bool,
+    pub(crate) onboarding_active: bool,
+    pub(crate) profile_field_index: usize,
     pub(crate) renaming_session: Option<usize>,
     pub(crate) renaming_project: Option<usize>,
+    pub(crate) jobs_flash_until: u64,
 
     // Interaction state, refreshed each frame by render_*.
     pub(crate) menu_hits: Vec<(Rect, MenuAction)>,
     pub(crate) tab_hits: Vec<(Rect, usize)>,
+    pub(crate) settings_hits: Vec<(Rect, usize)>,
+    pub(crate) profile_hits: Vec<(Rect, usize)>,
     pub(crate) project_hits: Vec<(Rect, usize)>,
     pub(crate) session_hits: Vec<(Rect, usize)>,
     pub(crate) hovered_menu: Option<MenuAction>,
+    pub(crate) hovered_settings: Option<usize>,
+    pub(crate) hovered_profile: Option<usize>,
     pub(crate) hovered_project: Option<usize>,
     pub(crate) hovered_session: Option<usize>,
     pub(crate) pressed_menu: Option<MenuAction>,
 }
 
 impl App {
+    pub const PROFILE_FIELDS: &'static [&'static str] = &[
+        "First Name",
+        "Last Name",
+        "SID",
+        "Email",
+        "API Key",
+    ];
+
     fn make_session(id: String, title: String) -> Session {
         Session {
             id,
@@ -87,6 +110,7 @@ impl App {
             pending_turn_id: None,
             pending_project_id: None,
             turn_steps: Vec::new(),
+            jobs: Vec::new(),
         }
     }
 
@@ -102,6 +126,13 @@ impl App {
             assistant_name: config.assistant_name,
             default_model: config.default_model,
             global_prompt: config.global_prompt,
+            show_jobs_pane: config.show_jobs_pane,
+            onboarding_complete: config.onboarding_complete,
+            first_name: config.first_name,
+            last_name: config.last_name,
+            sid: config.sid,
+            email: config.email,
+            api_key: config.api_key,
             current_workspace: paths.workspace.clone(),
             current_sessions_path: paths.sessions.clone(),
             paths,
@@ -114,13 +145,22 @@ impl App {
             selecting_project: false,
             selecting_session: false,
             selecting_prompt: false,
+            selecting_settings: false,
+            editing_profile: false,
+            onboarding_active: false,
+            profile_field_index: 0,
             renaming_session: None,
             renaming_project: None,
+            jobs_flash_until: 0,
             menu_hits: Vec::new(),
             tab_hits: Vec::new(),
+            settings_hits: Vec::new(),
+            profile_hits: Vec::new(),
             project_hits: Vec::new(),
             session_hits: Vec::new(),
             hovered_menu: None,
+            hovered_settings: None,
+            hovered_profile: None,
             hovered_project: None,
             hovered_session: None,
             pressed_menu: None,
@@ -135,6 +175,11 @@ impl App {
             app.active_session_id = Some(id);
         } else {
             app.active_session_id = app.sessions.first().map(|s| s.id.clone());
+        }
+
+        if !app.onboarding_complete {
+            app.onboarding_active = true;
+            app.editing_profile = true;
         }
 
         app
@@ -173,6 +218,56 @@ impl App {
             fs::write(path, text)?;
         }
         Ok(())
+    }
+
+    pub fn save_config(&self) -> Result<()> {
+        let config = Config {
+            user_name: self.user_name.clone(),
+            assistant_name: self.assistant_name.clone(),
+            default_model: self.default_model.clone(),
+            global_prompt: self.global_prompt.clone(),
+            show_jobs_pane: self.show_jobs_pane,
+            onboarding_complete: self.onboarding_complete,
+            first_name: self.first_name.clone(),
+            last_name: self.last_name.clone(),
+            sid: self.sid.clone(),
+            email: self.email.clone(),
+            api_key: self.api_key.clone(),
+        };
+        let text = serde_yaml::to_string(&config)?;
+        fs::write(&self.paths.config_file, text)?;
+        Ok(())
+    }
+
+    pub fn profile_field_value(&self, idx: usize) -> &str {
+        match idx {
+            0 => &self.first_name,
+            1 => &self.last_name,
+            2 => &self.sid,
+            3 => &self.email,
+            4 => &self.api_key,
+            _ => "",
+        }
+    }
+
+    pub fn profile_field_value_mut(&mut self, idx: usize) -> Option<&mut String> {
+        match idx {
+            0 => Some(&mut self.first_name),
+            1 => Some(&mut self.last_name),
+            2 => Some(&mut self.sid),
+            3 => Some(&mut self.email),
+            4 => Some(&mut self.api_key),
+            _ => None,
+        }
+    }
+
+    pub fn finish_profile_edit(&mut self) {
+        self.onboarding_complete = true;
+        self.onboarding_active = false;
+        self.editing_profile = false;
+        self.selecting_settings = false;
+        self.profile_field_index = 0;
+        self.save_config().ok();
     }
 
     pub fn load_projects(&mut self) -> Result<()> {
@@ -229,6 +324,7 @@ impl App {
         self.selecting_project = false;
         self.selecting_session = false;
         self.selecting_prompt = false;
+        self.selecting_settings = false;
         self.renaming_session = None;
         self.renaming_project = None;
 
@@ -332,12 +428,62 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press { return; }
+
+        if self.editing_profile {
+            match key.code {
+                KeyCode::Esc if !self.onboarding_active => {
+                    self.editing_profile = false;
+                    self.selecting_settings = false;
+                    self.profile_field_index = 0;
+                    self.save_config().ok();
+                }
+                KeyCode::Up => {
+                    self.profile_field_index = self.profile_field_index.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    self.profile_field_index =
+                        (self.profile_field_index + 1).min(Self::PROFILE_FIELDS.len() - 1);
+                }
+                KeyCode::BackTab => {
+                    self.profile_field_index = self.profile_field_index.saturating_sub(1);
+                }
+                KeyCode::Enter => {
+                    if self.profile_field_index + 1 >= Self::PROFILE_FIELDS.len() {
+                        self.finish_profile_edit();
+                    } else {
+                        self.profile_field_index += 1;
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(value) = self.profile_field_value_mut(self.profile_field_index) {
+                        value.pop();
+                    }
+                }
+                KeyCode::Delete => {
+                    if let Some(value) = self.profile_field_value_mut(self.profile_field_index) {
+                        value.clear();
+                    }
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    if let Some(value) = self.profile_field_value_mut(self.profile_field_index) {
+                        value.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         
         // Global escape from renaming/overlays
         if key.code == KeyCode::Esc {
             self.selecting_project = false;
             self.selecting_session = false;
             self.selecting_prompt = false;
+            self.selecting_settings = false;
+            self.hovered_settings = None;
             self.renaming_session = None;
             self.renaming_project = None;
             return;
@@ -405,15 +551,22 @@ impl App {
         match (key.code, key.modifiers) {
             (KeyCode::Tab, _) => { self.next_tab(); return; }
             (KeyCode::BackTab, _) => { self.prev_tab(); return; }
+            (KeyCode::Char('n'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.new_session();
+                return;
+            }
             (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
-                if self.selecting_session {
-                    if let Some(idx) = self.hovered_session {
-                        if idx < self.sessions.len() { self.renaming_session = Some(idx); }
-                    }
-                } else if self.selecting_project {
-                    if let Some(idx) = self.hovered_project {
-                        if idx > 0 && idx <= self.projects.len() { self.renaming_project = Some(idx - 1); }
-                    }
+                    if self.selecting_session {
+                        if let Some(idx) = self.hovered_session {
+                            if idx < self.sessions.len() { self.renaming_session = Some(idx); }
+                        }
+                    } else if self.selecting_settings {
+                        self.editing_profile = true;
+                        self.profile_field_index = 0;
+                    } else if self.selecting_project {
+                        if let Some(idx) = self.hovered_project {
+                            if idx > 0 && idx <= self.projects.len() { self.renaming_project = Some(idx - 1); }
+                        }
                 } else {
                     self.renaming_session = Some(self.active_tab);
                 }
@@ -438,6 +591,11 @@ impl App {
         let Some(session) = self.sessions.get_mut(self.active_tab) else { return; };
         let text = session.input.trim().to_string();
         if text.is_empty() { return; }
+        if text == "/new" {
+            session.input.clear();
+            self.new_session();
+            return;
+        }
         let turn_id = Uuid::new_v4().to_string();
         session.input.clear();
         session.messages.push(Message { role: Role::User, body: text, tool_calls: None });
@@ -471,6 +629,7 @@ impl App {
             project_id: self.active_project_id.clone(),
             board,
             custom_prompt,
+            agent: AgentKind::Orchestrator,
         };
         let _ = self.worker_tx.send(WorkerCmd::Send { turn_id, session_id, request });
         if self.active_project_id.is_some() { self.save_active_project().ok(); }
@@ -577,9 +736,6 @@ impl App {
                         self.scroll_to_bottom();
                     }
                 }
-                WorkerEvent::ToolResult { session_id, turn_id, content } => {
-                    let _ = (session_id, turn_id, content);
-                }
                 WorkerEvent::PhaseChange { session_id, turn_id, phase } => {
                     if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
                         upsert_turn_step(
@@ -618,6 +774,57 @@ impl App {
                         }
                     }
                 }
+                WorkerEvent::JobStarted { session_id, job } => {
+                    let project_to_save = job.project_id.clone();
+                    if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                        session.jobs.push(job);
+                    }
+                    self.save_after_event(project_to_save.as_deref(), &session_id);
+                }
+                WorkerEvent::JobUpdated { session_id, job_id, status, summary } => {
+                    let mut project_to_save = None;
+                    if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                        if let Some(job) = session.jobs.iter_mut().find(|job| job.id == job_id) {
+                            job.status = status;
+                            job.summary = summary;
+                            project_to_save = job.project_id.clone();
+                        }
+                        if matches!(status, JobStatus::Running) {
+                            self.tool_status = Some(format!("background job: {}", job_id.chars().take(8).collect::<String>()));
+                        } else if matches!(status, JobStatus::Completed | JobStatus::Failed) {
+                            self.jobs_flash_until = self.frame_count.saturating_add(36);
+                        }
+                    }
+                    self.save_after_event(project_to_save.as_deref(), &session_id);
+                }
+                WorkerEvent::JobMessage { session_id, job_id, content } => {
+                    let mut project_to_save = None;
+                    if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
+                        let message = session
+                            .jobs
+                            .iter()
+                            .find(|job| job.id == job_id)
+                            .map(|job| {
+                                project_to_save = job.project_id.clone();
+                                let prefix = match job.status {
+                                    JobStatus::Completed => format!("[{} completed]\n", job.title),
+                                    JobStatus::Failed => format!("[{} failed]\n", job.title),
+                                    _ => format!("[{}]\n", job.title),
+                                };
+                                format!("{}{}", prefix, content)
+                            })
+                            .unwrap_or(content);
+                        if !self.show_jobs_pane {
+                            session.messages.push(Message {
+                                role: Role::Assistant,
+                                body: message,
+                                tool_calls: None,
+                            });
+                            self.scroll_to_bottom();
+                        }
+                    }
+                    self.save_after_event(project_to_save.as_deref(), &session_id);
+                }
                 WorkerEvent::Error { session_id, turn_id, err } => {
                     let mut project_to_save = None;
                     if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
@@ -646,10 +853,31 @@ impl App {
     pub fn handle_mouse(&mut self, me: MouseEvent) {
         let pos = Position::new(me.column, me.row);
         match me.kind {
-            MouseEventKind::Moved | MouseEventKind::Drag(_) => { self.hovered_menu = self.menu_hit(pos); self.hovered_project = self.project_hit(pos); self.hovered_session = self.session_hit(pos); }
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => { self.hovered_menu = self.menu_hit(pos); self.hovered_settings = self.settings_hit(pos); self.hovered_profile = self.profile_hit(pos); self.hovered_project = self.project_hit(pos); self.hovered_session = self.session_hit(pos); }
             MouseEventKind::Down(btn) => {
                 if btn == MouseButton::Left {
                     // Overlays first
+                    if self.editing_profile {
+                        if let Some(idx) = self.profile_hit(pos) {
+                            self.profile_field_index = idx.min(Self::PROFILE_FIELDS.len() - 1);
+                            return;
+                        }
+                    }
+                    if self.selecting_settings {
+                        if let Some(idx) = self.settings_hit(pos) {
+                            if idx == 0 {
+                                self.show_jobs_pane = !self.show_jobs_pane;
+                                self.save_config().ok();
+                            } else if idx == 1 {
+                                self.editing_profile = true;
+                                self.profile_field_index = 0;
+                            }
+                            if !self.editing_profile {
+                                self.selecting_settings = false;
+                            }
+                            return;
+                        }
+                    }
                     if self.selecting_project {
                         if let Some(idx) = self.project_hit(pos) {
                             if idx == 0 { let _ = self.switch_project(None); }
@@ -694,15 +922,17 @@ impl App {
 
     pub fn menu_hit(&self, p: Position) -> Option<MenuAction> { self.menu_hits.iter().find(|(r, _)| r.contains(p)).map(|(_, a)| *a) }
     pub fn tab_hit(&self, p: Position) -> Option<usize> { self.tab_hits.iter().find(|(r, _)| r.contains(p)).map(|(_, i)| *i) }
+    pub fn settings_hit(&self, p: Position) -> Option<usize> { self.settings_hits.iter().find(|(r, _)| r.contains(p)).map(|(_, i)| *i) }
+    pub fn profile_hit(&self, p: Position) -> Option<usize> { self.profile_hits.iter().find(|(r, _)| r.contains(p)).map(|(_, i)| *i) }
     pub fn project_hit(&self, p: Position) -> Option<usize> { self.project_hits.iter().find(|(r, _)| r.contains(p)).map(|(_, i)| *i) }
     pub fn session_hit(&self, p: Position) -> Option<usize> { self.session_hits.iter().find(|(r, _)| r.contains(p)).map(|(_, i)| *i) }
 
     pub fn fire_menu(&mut self, action: MenuAction) {
         match action {
             MenuAction::Quit => self.running = false,
-            MenuAction::Projects => { self.selecting_project = !self.selecting_project; if self.selecting_project { self.load_projects().ok(); } self.selecting_session = false; self.selecting_prompt = false; }
-            MenuAction::Sessions => { self.selecting_session = !self.selecting_session; if self.selecting_session { self.load_sessions().ok(); } self.selecting_project = false; self.selecting_prompt = false; }
-            MenuAction::Prompt => { self.selecting_prompt = !self.selecting_prompt; self.selecting_project = false; self.selecting_session = false; }
+            MenuAction::Settings => { self.selecting_settings = !self.selecting_settings; self.selecting_project = false; self.selecting_session = false; self.selecting_prompt = false; }
+            MenuAction::Projects => { self.selecting_project = !self.selecting_project; if self.selecting_project { self.load_projects().ok(); } self.selecting_settings = false; self.selecting_session = false; self.selecting_prompt = false; }
+            MenuAction::Prompt => { self.selecting_prompt = !self.selecting_prompt; self.selecting_settings = false; self.selecting_project = false; self.selecting_session = false; }
             _ => {}
         }
     }

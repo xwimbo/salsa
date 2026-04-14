@@ -3,7 +3,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Sandbox {
     pub(crate) root: PathBuf,
 }

@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::agent::WorkerEvent;
 use crate::auth::CodexAuth;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CodexClient {
     client: reqwest::blocking::Client,
 }

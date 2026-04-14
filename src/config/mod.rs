@@ -11,6 +11,13 @@ pub struct Config {
     pub assistant_name: String,
     pub default_model: String,
     pub global_prompt: String,
+    pub show_jobs_pane: bool,
+    pub onboarding_complete: bool,
+    pub first_name: String,
+    pub last_name: String,
+    pub sid: String,
+    pub email: String,
+    pub api_key: String,
 }
 
 impl Default for Config {
@@ -20,6 +27,13 @@ impl Default for Config {
             assistant_name: "assistant".into(),
             default_model: "gpt-5.3-codex".into(),
             global_prompt: "You are a helpful assistant with specialized coding skillsets. Focus on clean code, idiomatic patterns, and efficient logic.".into(),
+            show_jobs_pane: true,
+            onboarding_complete: false,
+            first_name: String::new(),
+            last_name: String::new(),
+            sid: String::new(),
+            email: String::new(),
+            api_key: String::new(),
         }
     }
 }

@@ -1,4 +1,5 @@
 use std::io::{stdout, Stdout};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -89,7 +90,7 @@ fn main() -> Result<()> {
         }
         Err(_) => (Box::new(EchoProvider) as Box<dyn Provider>, auth::CodexAuth::default()),
     };
-    let worker = agent::worker::spawn_worker(provider);
+    let worker = agent::worker::spawn_worker(Arc::from(provider));
     let mut terminal = setup_terminal()?;
     let mut app = App::new(cfg, paths, worker, auth);
     let result = run(&mut terminal, &mut app);

@@ -1,4 +1,5 @@
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 
 use crate::agent::{Provider, WorkerCmd, WorkerEvent};
@@ -9,10 +10,11 @@ pub struct WorkerHandles {
     pub provider_label: &'static str,
 }
 
-pub fn spawn_worker(mut provider: Box<dyn Provider>) -> WorkerHandles {
+pub fn spawn_worker(provider: Arc<dyn Provider>) -> WorkerHandles {
     let provider_label = provider.label();
     let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
     let (event_tx, event_rx) = mpsc::channel::<WorkerEvent>();
+    let mut provider = provider;
     thread::spawn(move || {
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
@@ -21,10 +23,14 @@ pub fn spawn_worker(mut provider: Box<dyn Provider>) -> WorkerHandles {
                     session_id,
                     request,
                 } => {
-                    provider.generate(&request, session_id, turn_id, &event_tx);
+                    let provider = Arc::clone(&provider);
+                    let event_tx = event_tx.clone();
+                    thread::spawn(move || {
+                        provider.generate(&request, session_id, turn_id, &event_tx);
+                    });
                 }
                 WorkerCmd::UpdateProvider { provider: new_provider } => {
-                    provider = new_provider;
+                    provider = Arc::from(new_provider);
                 }
                 WorkerCmd::Shutdown => break,
             }

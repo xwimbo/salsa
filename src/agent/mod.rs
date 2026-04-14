@@ -4,7 +4,9 @@ pub mod worker;
 pub use provider::Provider;
 pub use worker::WorkerHandles;
 
-use crate::models::{AgentPhase, Board, ExecutionArtifact, Role, TurnStepStatus};
+use crate::models::{
+    AgentKind, AgentPhase, BackgroundJob, Board, ExecutionArtifact, Role, TurnStepStatus,
+};
 use serde_json;
 
 #[derive(Debug, Clone)]
@@ -33,12 +35,12 @@ impl ProviderMessage {
             }
             Role::System => serde_json::json!({
                 "role": "system",
-                "content": [{"type": "text", "text": self.content}],
+                "content": [{"type": "input_text", "text": self.content}],
             }),
             Role::ToolResult => {
                 serde_json::json!({
                     "role": "system",
-                    "content": [{"type": "text", "text": self.content}],
+                    "content": [{"type": "input_text", "text": self.content}],
                 })
             }
         }
@@ -52,6 +54,7 @@ pub struct ProviderRequest {
     pub project_id: Option<String>,
     pub board: Option<Board>,
     pub custom_prompt: Option<String>,
+    pub agent: AgentKind,
 }
 
 #[derive(Debug)]
@@ -75,7 +78,6 @@ pub enum WorkerEvent {
     SystemNote { session_id: String, turn_id: String, note: String },
     ToolStatus { session_id: String, turn_id: String, status: String },
     ToolCalls { session_id: String, turn_id: String, calls: serde_json::Value },
-    ToolResult { session_id: String, turn_id: String, content: String },
     PhaseChange { session_id: String, turn_id: String, phase: AgentPhase },
     StepUpdate {
         session_id: String,
@@ -95,6 +97,21 @@ pub enum WorkerEvent {
         turn_id: String,
         project_id: Option<String>,
         operations: Vec<crate::models::BoardOperation>,
+    },
+    JobStarted {
+        session_id: String,
+        job: BackgroundJob,
+    },
+    JobUpdated {
+        session_id: String,
+        job_id: String,
+        status: crate::models::JobStatus,
+        summary: String,
+    },
+    JobMessage {
+        session_id: String,
+        job_id: String,
+        content: String,
     },
     Error { session_id: String, turn_id: String, err: String },
 }

@@ -9,7 +9,7 @@ use ratatui::Frame;
 
 use crate::app::{App, MenuAction};
 use crate::config;
-use crate::models::{ExecutionArtifact, Role, TurnStepStatus};
+use crate::models::{AgentKind, ExecutionArtifact, JobStatus, Role, TurnStepStatus};
 
 impl App {
     pub fn render(&mut self, frame: &mut Frame<'_>) {
@@ -27,12 +27,164 @@ impl App {
             .split(area);
         self.render_menu(frame, chunks[0]);
         self.render_tabs(frame, chunks[1]);
-        self.render_chat(frame, chunks[2]);
+        let content_chunks = if self.should_show_jobs_pane(chunks[2]) {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(1), Constraint::Length(32)])
+                .split(chunks[2])
+        } else {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(1), Constraint::Length(0)])
+                .split(chunks[2])
+        };
+        self.render_chat(frame, content_chunks[0]);
+        if content_chunks[1].width > 0 {
+            self.render_jobs(frame, content_chunks[1]);
+        }
         self.render_input(frame, chunks[3]);
         self.render_overlays(frame, area);
     }
 
+    fn should_show_jobs_pane(&self, area: Rect) -> bool {
+        self.show_jobs_pane
+            && area.width >= 80
+            && self
+                .sessions
+                .get(self.active_tab)
+                .map(|session| !session.jobs.is_empty())
+                .unwrap_or(false)
+    }
+
     fn render_overlays(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        if self.selecting_settings {
+            let overlay = Rect {
+                x: area.x + 1,
+                y: area.y + 1,
+                width: 34,
+                height: 5,
+            };
+            frame.render_widget(Clear, overlay);
+            let block = Block::default()
+                .title(" Settings ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::ORANGE));
+            let inner = block.inner(overlay);
+            frame.render_widget(block, overlay);
+            self.settings_hits.clear();
+            let rect0 = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 1,
+            };
+            let style = if self.hovered_settings == Some(0) {
+                Style::default().bg(theme::BG_ALT).fg(theme::ORANGE)
+            } else {
+                Style::default().fg(theme::FG)
+            };
+            let label = if self.show_jobs_pane {
+                "[x] Show Jobs Queue"
+            } else {
+                "[ ] Show Jobs Queue"
+            };
+            frame.render_widget(Paragraph::new(label).style(style), rect0);
+            self.settings_hits.push((rect0, 0));
+            let rect1 = Rect {
+                x: inner.x,
+                y: inner.y + 1,
+                width: inner.width,
+                height: 1,
+            };
+            let style1 = if self.hovered_settings == Some(1) {
+                Style::default().bg(theme::BG_ALT).fg(theme::ORANGE)
+            } else {
+                Style::default().fg(theme::FG)
+            };
+            frame.render_widget(Paragraph::new("Edit Profile").style(style1), rect1);
+            self.settings_hits.push((rect1, 1));
+        }
+
+        if self.editing_profile {
+            let overlay = Rect {
+                x: area.x + 6,
+                y: area.y + 3,
+                width: area.width.saturating_sub(12).max(48),
+                height: 13,
+            };
+            frame.render_widget(Clear, overlay);
+            let title = if self.onboarding_active {
+                " Welcome Setup "
+            } else {
+                " Profile Settings "
+            };
+            let block = Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::ORANGE));
+            let inner = block.inner(overlay);
+            frame.render_widget(block, overlay);
+            self.profile_hits.clear();
+
+            let intro = if self.onboarding_active {
+                "First run setup. Add your profile details. Enter saves on the last field."
+            } else {
+                "Edit stored profile fields. `Delete` clears a field. `Esc` closes."
+            };
+            frame.render_widget(
+                Paragraph::new(intro).wrap(Wrap { trim: false }),
+                Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: inner.width,
+                    height: 2,
+                },
+            );
+
+            for (idx, label) in App::PROFILE_FIELDS.iter().enumerate() {
+                let row = Rect {
+                    x: inner.x,
+                    y: inner.y + 3 + idx as u16,
+                    width: inner.width,
+                    height: 1,
+                };
+                let active = self.profile_field_index == idx;
+                let style = if active {
+                    Style::default().bg(theme::BG_ALT).fg(theme::ORANGE)
+                } else if self.hovered_profile == Some(idx) {
+                    Style::default().bg(theme::BG_ALT).fg(theme::FG)
+                } else {
+                    Style::default().fg(theme::FG)
+                };
+                let mut value = self.profile_field_value(idx).to_string();
+                if idx == 4 && !value.is_empty() {
+                    value = "*".repeat(value.chars().count().min(24));
+                }
+                if active {
+                    value.push('▏');
+                }
+                let field = format!("{label:>11}: {value}");
+                frame.render_widget(Paragraph::new(field).style(style), row);
+                self.profile_hits.push((row, idx));
+            }
+
+            let footer = if self.onboarding_active {
+                "Up/Down to move. Enter advances. Finish on API Key to start."
+            } else {
+                "Up/Down to move. Enter advances. Finish on API Key to save."
+            };
+            frame.render_widget(
+                Paragraph::new(footer).style(Style::default().fg(theme::MUTED)),
+                Rect {
+                    x: inner.x,
+                    y: inner.bottom().saturating_sub(1),
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+        }
         if self.selecting_project {
             let overlay = Rect {
                 x: area.x + 5,
@@ -60,7 +212,7 @@ impl App {
             } else {
                 Style::default().fg(theme::FG)
             };
-            frame.render_widget(Paragraph::new(" [Global Sessions]").style(gs), gr);
+            frame.render_widget(Paragraph::new(" [Global Project]").style(gs), gr);
             self.project_hits.push((gr, 0));
             y += 1;
             for (idx, project) in self.projects.iter().enumerate() {
@@ -504,6 +656,84 @@ impl App {
         }
     }
 
+    fn render_jobs(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let border_style = if self.frame_count <= self.jobs_flash_until {
+            Style::default().fg(theme::pending_border_color(self.frame_count))
+        } else {
+            Style::default().fg(theme::BORDER)
+        };
+        let block = Block::default()
+            .title(" Jobs ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(border_style);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let Some(session) = self.sessions.get(self.active_tab) else {
+            return;
+        };
+
+        let mut lines: Vec<Line> = Vec::new();
+        for job in session.jobs.iter().rev().take(8) {
+            let status_marker = match job.status {
+                JobStatus::Queued => "○",
+                JobStatus::Running => "◌",
+                JobStatus::Completed => "•",
+                JobStatus::Failed => "!",
+            };
+            let status_style = match job.status {
+                JobStatus::Queued => Style::default().fg(theme::MUTED),
+                JobStatus::Running => Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD),
+                JobStatus::Completed => Style::default().fg(theme::FG),
+                JobStatus::Failed => Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+            };
+            let agent_label = match job.agent {
+                AgentKind::Orchestrator => "orch",
+                AgentKind::Planner => "plan",
+                AgentKind::Coder => "code",
+            };
+            let mut title = job.title.clone();
+            let max_title = inner.width.saturating_sub(8) as usize;
+            if max_title > 0 && title.chars().count() > max_title {
+                title = title.chars().take(max_title.saturating_sub(1)).collect::<String>();
+                title.push('…');
+            }
+            lines.push(Line::from(vec![
+                Span::styled(format!("{status_marker} "), status_style),
+                Span::styled(
+                    format!("{agent_label} "),
+                    Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(title, Style::default().fg(theme::FG)),
+            ]));
+            if !job.summary.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", job.summary),
+                    Style::default().fg(theme::MUTED),
+                )));
+            }
+            lines.push(Line::from(""));
+        }
+
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No jobs yet.",
+                Style::default().fg(theme::MUTED),
+            )));
+        }
+
+        frame.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }),
+            Rect {
+                x: inner.x + 1,
+                y: inner.y,
+                width: inner.width.saturating_sub(2),
+                height: inner.height,
+            },
+        );
+    }
+
     fn render_input(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let pending = self.active_session_pending();
         let border_color = if pending {
@@ -570,7 +800,7 @@ impl App {
             .get(self.active_tab)
             .map(|s| s.input.as_str())
             .unwrap_or("");
-        let line = if content.is_empty() {
+        let input_line = if content.is_empty() {
             Line::from(Span::styled(
                 "type a message…",
                 Style::default().fg(theme::MUTED),
@@ -581,7 +811,7 @@ impl App {
                 Span::styled("▏", Style::default().fg(theme::ORANGE)),
             ])
         };
-        frame.render_widget(Paragraph::new(line), padded);
+        frame.render_widget(Paragraph::new(input_line).wrap(Wrap { trim: false }), padded);
     }
 }
 
