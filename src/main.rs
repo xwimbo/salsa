@@ -11,17 +11,17 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::Terminal;
 
-mod app;
 mod agent;
 mod api;
+mod app;
 mod auth;
 mod config;
 mod models;
 mod tools;
 mod ui;
 
-use app::App;
 use agent::provider::{CodexProvider, EchoProvider, Provider};
+use app::App;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -37,7 +37,11 @@ fn setup_terminal() -> Result<Tui> {
 
 fn restore_terminal(terminal: &mut Tui) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -60,20 +64,28 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
         loop {
             let now = Instant::now();
             if now >= next_frame {
-                if now.saturating_duration_since(next_frame) > FRAME_BUDGET * 4 { next_frame = now; }
+                if now.saturating_duration_since(next_frame) > FRAME_BUDGET * 4 {
+                    next_frame = now;
+                }
                 next_frame += FRAME_BUDGET;
                 break;
             }
-            if events_handled >= MAX_EVENTS_PER_FRAME { break; }
+            if events_handled >= MAX_EVENTS_PER_FRAME {
+                break;
+            }
             let timeout = next_frame - now;
-            if !event::poll(timeout)? { continue; }
+            if !event::poll(timeout)? {
+                continue;
+            }
             match event::read()? {
                 Event::Key(key) => app.handle_key(key),
                 Event::Mouse(me) => app.handle_mouse(me),
                 _ => {}
             }
             events_handled += 1;
-            if !app.is_running() { break; }
+            if !app.is_running() {
+                break;
+            }
         }
     }
     Ok(())
@@ -82,13 +94,12 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
 fn main() -> Result<()> {
     install_panic_hook();
     let (cfg, paths) = config::bootstrap()?;
-    let auth_res = auth::CodexAuth::load_from_disk();
-    let (provider, auth) = match auth_res {
-        Ok(auth) => {
-            let p = CodexProvider::new(auth.clone(), paths.workspace.clone())?;
-            (Box::new(p) as Box<dyn Provider>, auth)
-        }
-        Err(_) => (Box::new(EchoProvider) as Box<dyn Provider>, auth::CodexAuth::default()),
+    let (provider, auth): (Box<dyn Provider>, _) = match auth::CodexAuth::load_from_disk() {
+        Ok(auth) => (
+            Box::new(CodexProvider::new(auth.clone(), paths.workspace.clone())?),
+            auth,
+        ),
+        Err(_) => (Box::new(EchoProvider), auth::CodexAuth::default()),
     };
     let worker = agent::worker::spawn_worker(Arc::from(provider));
     let mut terminal = setup_terminal()?;

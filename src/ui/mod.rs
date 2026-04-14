@@ -3,7 +3,10 @@ pub mod theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Wrap,
+};
 use ratatui::Frame;
 // use tui_tabs::TabNav;
 
@@ -230,12 +233,19 @@ impl App {
                 } else {
                     Style::default().fg(theme::FG)
                 };
-                
-                let mut display_name = if project.name.len() > 15 { format!("{}…", &project.name[..14]) } else { project.name.clone() };
+
+                let mut display_name = if project.name.len() > 15 {
+                    format!("{}…", &project.name[..14])
+                } else {
+                    project.name.clone()
+                };
                 if self.renaming_project == Some(idx) {
                     display_name = format!("*{}", display_name);
                 }
-                frame.render_widget(Paragraph::new(format!(" {}", display_name)).style(style), rect);
+                frame.render_widget(
+                    Paragraph::new(format!(" {}", display_name)).style(style),
+                    rect,
+                );
                 self.project_hits.push((rect, idx + 1));
                 y += 1;
             }
@@ -288,7 +298,10 @@ impl App {
                 if self.renaming_session == Some(idx) {
                     display_title = format!("*{}", display_title);
                 }
-                frame.render_widget(Paragraph::new(format!(" {}", display_title)).style(style), rect);
+                frame.render_widget(
+                    Paragraph::new(format!(" {}", display_title)).style(style),
+                    rect,
+                );
                 self.session_hits.push((rect, idx));
                 y += 1;
             }
@@ -314,10 +327,17 @@ impl App {
                 height: area.height.saturating_sub(10),
             };
             frame.render_widget(Clear, overlay);
-            let title = if let Some(id) = &self.active_project_id { 
-                let name = self.projects.iter().find(|p| p.id == *id).map(|p| p.name.as_str()).unwrap_or("?");
-                format!("Project Prompt: {}", name) 
-            } else { "Global Prompt".to_string() };
+            let title = if let Some(id) = &self.active_project_id {
+                let name = self
+                    .projects
+                    .iter()
+                    .find(|p| p.id == *id)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("?");
+                format!("Project Prompt: {}", name)
+            } else {
+                "Global Prompt".to_string()
+            };
             let block = Block::default()
                 .title(format!(" {} ", title))
                 .borders(Borders::ALL)
@@ -325,14 +345,21 @@ impl App {
                 .border_style(Style::default().fg(theme::ORANGE));
             let inner = block.inner(overlay);
             frame.render_widget(block, overlay);
-            
+
             let prompt_text = if let Some(id) = &self.active_project_id {
-                self.projects.iter().find(|p| p.id == *id).and_then(|p| p.prompt.as_deref()).unwrap_or(&self.global_prompt)
+                self.projects
+                    .iter()
+                    .find(|p| p.id == *id)
+                    .and_then(|p| p.prompt.as_deref())
+                    .unwrap_or(&self.global_prompt)
             } else {
                 &self.global_prompt
             };
-            
-            frame.render_widget(Paragraph::new(prompt_text).wrap(Wrap { trim: false }), inner);
+
+            frame.render_widget(
+                Paragraph::new(prompt_text).wrap(Wrap { trim: false }),
+                inner,
+            );
         }
     }
 
@@ -370,7 +397,12 @@ impl App {
             x += width + 1;
         }
         let project_prefix = if let Some(id) = &self.active_project_id {
-            let name = self.projects.iter().find(|p| p.id == *id).map(|p| p.name.as_str()).unwrap_or("?");
+            let name = self
+                .projects
+                .iter()
+                .find(|p| p.id == *id)
+                .map(|p| p.name.as_str())
+                .unwrap_or("?");
             format!("project: {}  •  ", name)
         } else {
             "global  •  ".to_string()
@@ -378,32 +410,31 @@ impl App {
         let workspace_path = config::tilde_path(&self.current_workspace);
         let status = format!(
             "{}mode: {}  •  workspace: {}",
-            project_prefix,
-            self.provider_label,
-            workspace_path
+            project_prefix, self.provider_label, workspace_path
         );
         let mut status_width = status.chars().count() as u16;
         let available_status_width = area.width.saturating_sub(x - area.x + 2);
-        
+
         if status_width > available_status_width && available_status_width > 10 {
             // Truncate workspace path more aggressively
             let truncated_workspace = if workspace_path.len() > 10 {
-                format!("…{}", &workspace_path[workspace_path.len().saturating_sub(8)..])
+                format!(
+                    "…{}",
+                    &workspace_path[workspace_path.len().saturating_sub(8)..]
+                )
             } else {
                 workspace_path.clone()
             };
             let mut new_status = format!(
                 "{}mode: {}  •  ws: {}",
-                project_prefix,
-                self.provider_label,
-                truncated_workspace
+                project_prefix, self.provider_label, truncated_workspace
             );
             status_width = new_status.chars().count() as u16;
-            
+
             // If still too long, drop the prefix if we must, but try to keep it
             if status_width > available_status_width {
-                 new_status = format!("{} • ws: {}", self.provider_label, truncated_workspace);
-                 status_width = new_status.chars().count() as u16;
+                new_status = format!("{} • ws: {}", self.provider_label, truncated_workspace);
+                status_width = new_status.chars().count() as u16;
             }
 
             if status_width <= available_status_width {
@@ -445,12 +476,14 @@ impl App {
         }
         let max_width = area.width;
         let mut start_idx = 0;
-        
+
         // Find start_idx such that active_tab is visible and we fit as many as possible
         for i in 0..=self.active_tab {
             let mut w_total = 0;
             let mut active_fits = false;
-            if i > 0 { w_total += 3; } // for «
+            if i > 0 {
+                w_total += 3;
+            } // for «
             for j in i..self.sessions.len() {
                 let mut display_title = self.sessions[j].title.chars().take(6).collect::<String>();
                 if self.renaming_session == Some(j) {
@@ -474,8 +507,21 @@ impl App {
 
         let mut x_offset = 0;
         if start_idx > 0 {
-            let rect = Rect { x: area.x + x_offset, y: area.y, width: 3, height: 3 };
-            frame.render_widget(Paragraph::new("«").block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(theme::BORDER))), rect);
+            let rect = Rect {
+                x: area.x + x_offset,
+                y: area.y,
+                width: 3,
+                height: 3,
+            };
+            frame.render_widget(
+                Paragraph::new("«").block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(theme::BORDER)),
+                ),
+                rect,
+            );
             x_offset += 3;
         }
 
@@ -493,7 +539,9 @@ impl App {
 
             let is_active = i == self.active_tab;
             let style = if is_active {
-                Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme::ORANGE)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme::MUTED)
             };
@@ -510,21 +558,39 @@ impl App {
                 height: 3,
             };
             self.tab_hits.push((rect, i));
-            
+
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(border_style);
-            
-            frame.render_widget(Paragraph::new(format!(" {} ", display_title)).block(block).style(style), rect);
-            
+
+            frame.render_widget(
+                Paragraph::new(format!(" {} ", display_title))
+                    .block(block)
+                    .style(style),
+                rect,
+            );
+
             x_offset += w;
             last_rendered_idx = i;
         }
 
         if last_rendered_idx < self.sessions.len() - 1 {
-            let rect = Rect { x: area.x + x_offset, y: area.y, width: 3, height: 3 };
-            frame.render_widget(Paragraph::new("»").block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).border_style(Style::default().fg(theme::BORDER))), rect);
+            let rect = Rect {
+                x: area.x + x_offset,
+                y: area.y,
+                width: 3,
+                height: 3,
+            };
+            frame.render_widget(
+                Paragraph::new("»").block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(theme::BORDER)),
+                ),
+                rect,
+            );
         }
     }
 
@@ -535,7 +601,7 @@ impl App {
             .border_style(Style::default().fg(theme::BORDER));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        
+
         // Use a scope to get a copy of the scroll value to avoid borrowing issues later
         let (current_session_scroll, active_tab) = {
             let Some(session) = self.sessions.get(self.active_tab) else {
@@ -557,7 +623,12 @@ impl App {
                         Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
                     )));
                     if msg.body.is_empty() {
-                        lines.push(Line::from(Span::styled("(empty message)", Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC))));
+                        lines.push(Line::from(Span::styled(
+                            "(empty message)",
+                            Style::default()
+                                .fg(theme::MUTED)
+                                .add_modifier(Modifier::ITALIC),
+                        )));
                     } else {
                         for bl in msg.body.lines() {
                             lines.push(Line::from(Span::styled(
@@ -582,22 +653,32 @@ impl App {
                         )));
                         has_text = true;
                     }
-                    
+
                     // Show tool indicators only if the session is still pending AND this is the last message
                     let is_last_msg = i == session.messages.len() - 1;
                     if session.pending && is_last_msg {
                         if let Some(ref calls) = msg.tool_calls {
                             if let Some(calls_arr) = calls.as_array() {
                                 for call in calls_arr {
-                                    let name = call.pointer("/function/name").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let name = call
+                                        .pointer("/function/name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("?");
                                     lines.push(Line::from(Span::styled(
                                         format!("  ▸ tool: {}", name),
-                                        Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC),
+                                        Style::default()
+                                            .fg(theme::MUTED)
+                                            .add_modifier(Modifier::ITALIC),
                                     )));
                                 }
                             }
                         } else if !has_text {
-                            lines.push(Line::from(Span::styled("  (thinking...)", Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC))));
+                            lines.push(Line::from(Span::styled(
+                                "  (thinking...)",
+                                Style::default()
+                                    .fg(theme::MUTED)
+                                    .add_modifier(Modifier::ITALIC),
+                            )));
                         }
                     }
                 }
@@ -629,7 +710,7 @@ impl App {
 
         let max_scroll = total_wrapped_height.saturating_sub(padded.height as usize) as u16;
         let current_scroll = current_session_scroll.min(max_scroll);
-        
+
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -647,7 +728,7 @@ impl App {
             inner,
             &mut scroll_state,
         );
-        
+
         // ONLY update the session scroll if it was clamped, otherwise let handle_mouse/key own it
         if let Some(s) = self.sessions.get_mut(active_tab) {
             if s.scroll > max_scroll {
@@ -684,7 +765,9 @@ impl App {
             };
             let status_style = match job.status {
                 JobStatus::Queued => Style::default().fg(theme::MUTED),
-                JobStatus::Running => Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD),
+                JobStatus::Running => Style::default()
+                    .fg(theme::ORANGE)
+                    .add_modifier(Modifier::BOLD),
                 JobStatus::Completed => Style::default().fg(theme::FG),
                 JobStatus::Failed => Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
             };
@@ -692,18 +775,24 @@ impl App {
                 AgentKind::Orchestrator => "orch",
                 AgentKind::Planner => "plan",
                 AgentKind::Coder => "code",
+                AgentKind::Analyst => "data",
             };
             let mut title = job.title.clone();
             let max_title = inner.width.saturating_sub(8) as usize;
             if max_title > 0 && title.chars().count() > max_title {
-                title = title.chars().take(max_title.saturating_sub(1)).collect::<String>();
+                title = title
+                    .chars()
+                    .take(max_title.saturating_sub(1))
+                    .collect::<String>();
                 title.push('…');
             }
             lines.push(Line::from(vec![
                 Span::styled(format!("{status_marker} "), status_style),
                 Span::styled(
                     format!("{agent_label} "),
-                    Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme::ORANGE)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(title, Style::default().fg(theme::FG)),
             ]));
@@ -759,7 +848,9 @@ impl App {
             let status = self.tool_status.as_deref().unwrap_or("thinking…");
             lines.push(Line::from(Span::styled(
                 status,
-                Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(theme::MUTED)
+                    .add_modifier(Modifier::ITALIC),
             )));
             if let Some(session) = session {
                 for step in session.turn_steps.iter().rev().take(3).rev() {
@@ -783,16 +874,15 @@ impl App {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("{marker} {phase}: "),
-                            Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(theme::ORANGE)
+                                .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(detail.to_string(), Style::default().fg(theme::FG)),
                     ]));
                 }
             }
-            frame.render_widget(
-                Paragraph::new(lines).wrap(Wrap { trim: false }),
-                padded,
-            );
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), padded);
             return;
         }
         let content = self
@@ -811,7 +901,10 @@ impl App {
                 Span::styled("▏", Style::default().fg(theme::ORANGE)),
             ])
         };
-        frame.render_widget(Paragraph::new(input_line).wrap(Wrap { trim: false }), padded);
+        frame.render_widget(
+            Paragraph::new(input_line).wrap(Wrap { trim: false }),
+            padded,
+        );
     }
 }
 

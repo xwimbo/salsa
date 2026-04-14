@@ -15,19 +15,10 @@ struct Tokens {
     account_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CodexAuth {
     pub access_token: String,
     pub account_id: Option<String>,
-}
-
-impl Default for CodexAuth {
-    fn default() -> Self {
-        Self {
-            access_token: String::new(),
-            account_id: None,
-        }
-    }
 }
 
 impl CodexAuth {
@@ -35,10 +26,10 @@ impl CodexAuth {
         let path = dirs::home_dir()
             .context("no home directory")?
             .join(".codex/auth.json");
-        let text = fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let parsed: AuthFile = serde_json::from_str(&text)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let parsed: AuthFile =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         let tokens = parsed
             .tokens
             .ok_or_else(|| anyhow!("no `tokens` in {}", path.display()))?;

@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 
 use anyhow::Result;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Position, Rect};
 
-use crate::agent::{WorkerCmd, WorkerEvent, WorkerHandles, ProviderMessage, ProviderRequest};
 use crate::agent::provider::CodexProvider;
+use crate::agent::{ProviderMessage, ProviderRequest, WorkerCmd, WorkerEvent, WorkerHandles};
 use crate::auth::CodexAuth;
 use crate::config::{Config, Paths};
 use crate::models::{
@@ -91,13 +93,8 @@ pub struct App {
 }
 
 impl App {
-    pub const PROFILE_FIELDS: &'static [&'static str] = &[
-        "First Name",
-        "Last Name",
-        "SID",
-        "Email",
-        "API Key",
-    ];
+    pub const PROFILE_FIELDS: &'static [&'static str] =
+        &["First Name", "Last Name", "SID", "Email", "API Key"];
 
     fn make_session(id: String, title: String) -> Session {
         Session {
@@ -112,6 +109,23 @@ impl App {
             turn_steps: Vec::new(),
             jobs: Vec::new(),
         }
+    }
+
+    fn sync_active_session(&mut self, idx: usize) {
+        self.active_tab = idx;
+        self.active_session_id = self.sessions.get(idx).map(|s| s.id.clone());
+    }
+
+    fn save_current_scope(&mut self) {
+        if self.active_project_id.is_some() {
+            self.save_active_project().ok();
+        } else {
+            self.save_active_session().ok();
+        }
+    }
+
+    fn set_phase_status(&mut self, phase: AgentPhase) {
+        self.tool_status = Some(phase.status().into());
     }
 
     pub fn new(config: Config, paths: Paths, worker: WorkerHandles, auth: CodexAuth) -> Self {
@@ -171,7 +185,8 @@ impl App {
 
         if app.sessions.is_empty() {
             let id = Uuid::new_v4().to_string();
-            app.sessions.push(Self::make_session(id.clone(), "chat 1".into()));
+            app.sessions
+                .push(Self::make_session(id.clone(), "chat 1".into()));
             app.active_session_id = Some(id);
         } else {
             app.active_session_id = app.sessions.first().map(|s| s.id.clone());
@@ -188,19 +203,22 @@ impl App {
     pub fn load_sessions(&mut self) -> Result<()> {
         let dir = &self.current_sessions_path;
         self.sessions.clear();
-        if !dir.exists() { return Ok(()); }
+        if !dir.exists() {
+            return Ok(());
+        }
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("yaml") {
                 let text = fs::read_to_string(&path)?;
                 if let Ok(session) = serde_yaml::from_str::<Session>(&text) {
-                    self.sessions.push(Self::compacted_session_snapshot(&session));
+                    self.sessions
+                        .push(Self::compacted_session_snapshot(&session));
                 }
             }
         }
         self.sessions.sort_by(|a, b| a.title.cmp(&b.title));
-        
+
         // Sync active_tab with active_session_id if possible
         if let Some(id) = &self.active_session_id {
             if let Some(idx) = self.sessions.iter().position(|s| s.id == *id) {
@@ -213,7 +231,9 @@ impl App {
     pub fn save_active_session(&self) -> Result<()> {
         if let Some(session) = self.sessions.get(self.active_tab) {
             fs::create_dir_all(&self.current_sessions_path)?;
-            let path = self.current_sessions_path.join(format!("{}.yaml", session.id));
+            let path = self
+                .current_sessions_path
+                .join(format!("{}.yaml", session.id));
             let text = serde_yaml::to_string(&Self::compacted_session_snapshot(session))?;
             fs::write(path, text)?;
         }
@@ -273,7 +293,9 @@ impl App {
     pub fn load_projects(&mut self) -> Result<()> {
         let dir = &self.paths.projects;
         self.projects.clear();
-        if !dir.exists() { return Ok(()); }
+        if !dir.exists() {
+            return Ok(());
+        }
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -312,14 +334,13 @@ impl App {
     }
 
     pub fn switch_project(&mut self, id: Option<String>) -> Result<()> {
-        if self.active_project_id.is_some() { self.save_active_project().ok(); }
-        else { self.save_active_session().ok(); }
+        self.save_current_scope();
 
         self.active_project_id = id;
         self.sessions.clear();
         self.active_tab = 0;
         self.active_session_id = None;
-        
+
         // Reset UI states
         self.selecting_project = false;
         self.selecting_session = false;
@@ -379,35 +400,37 @@ impl App {
     pub fn close_session(&mut self, idx: usize) {
         self.sessions.remove(idx);
         if self.sessions.is_empty() {
-            self.sessions
-                .push(Self::make_session(Uuid::new_v4().to_string(), "chat 1".into()));
+            self.sessions.push(Self::make_session(
+                Uuid::new_v4().to_string(),
+                "chat 1".into(),
+            ));
         }
         if self.active_tab >= self.sessions.len() {
             self.active_tab = self.sessions.len().saturating_sub(1);
         }
-        self.active_session_id = self.sessions.get(self.active_tab).map(|s| s.id.clone());
-        if self.active_project_id.is_some() { self.save_active_project().ok(); }
+        self.sync_active_session(self.active_tab);
+        self.save_current_scope();
     }
 
     pub fn delete_session(&mut self, idx: usize) {
         let session = self.sessions.remove(idx);
-        let path = self.current_sessions_path.join(format!("{}.yaml", session.id));
+        let path = self
+            .current_sessions_path
+            .join(format!("{}.yaml", session.id));
         fs::remove_file(path).ok();
-        
+
         if self.sessions.is_empty() {
             let session_id = Uuid::new_v4().to_string();
             self.sessions
                 .push(Self::make_session(session_id.clone(), "chat 1".into()));
             self.active_session_id = Some(session_id);
         }
-        
+
         if self.active_tab >= self.sessions.len() {
             self.active_tab = self.sessions.len().saturating_sub(1);
         }
-        self.active_session_id = self.sessions.get(self.active_tab).map(|s| s.id.clone());
-        
-        if self.active_project_id.is_some() { self.save_active_project().ok(); }
-        else { self.save_active_session().ok(); }
+        self.sync_active_session(self.active_tab);
+        self.save_current_scope();
     }
 
     pub fn new_session(&mut self) {
@@ -418,16 +441,18 @@ impl App {
             title = format!("chat {}", n);
         }
         let id = Uuid::new_v4().to_string();
-        self.sessions.push(Self::make_session(id.clone(), title.clone()));
+        self.sessions
+            .push(Self::make_session(id.clone(), title.clone()));
         self.active_tab = self.sessions.len() - 1;
         self.active_session_id = Some(id);
         self.selecting_session = false;
-        if self.active_project_id.is_some() { self.save_active_project().ok(); }
-        else { self.save_active_session().ok(); }
+        self.save_current_scope();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) {
-        if key.kind != KeyEventKind::Press { return; }
+        if key.kind != KeyEventKind::Press {
+            return;
+        }
 
         if self.editing_profile {
             match key.code {
@@ -476,7 +501,7 @@ impl App {
             }
             return;
         }
-        
+
         // Global escape from renaming/overlays
         if key.code == KeyCode::Esc {
             self.selecting_project = false;
@@ -491,9 +516,20 @@ impl App {
 
         if let Some(idx) = self.renaming_session {
             match key.code {
-                KeyCode::Enter | KeyCode::Esc => { self.renaming_session = None; if self.active_project_id.is_some() { self.save_active_project().ok(); } else { self.save_active_session().ok(); } }
-                KeyCode::Backspace => { if let Some(s) = self.sessions.get_mut(idx) { s.title.pop(); } }
-                KeyCode::Char(c) => { if let Some(s) = self.sessions.get_mut(idx) { s.title.push(c); } }
+                KeyCode::Enter | KeyCode::Esc => {
+                    self.renaming_session = None;
+                    self.save_current_scope();
+                }
+                KeyCode::Backspace => {
+                    if let Some(s) = self.sessions.get_mut(idx) {
+                        s.title.pop();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if let Some(s) = self.sessions.get_mut(idx) {
+                        s.title.push(c);
+                    }
+                }
                 _ => {}
             }
             return;
@@ -501,9 +537,20 @@ impl App {
 
         if let Some(idx) = self.renaming_project {
             match key.code {
-                KeyCode::Enter | KeyCode::Esc => { self.renaming_project = None; self.save_active_project().ok(); }
-                KeyCode::Backspace => { if let Some(p) = self.projects.get_mut(idx) { p.name.pop(); } }
-                KeyCode::Char(c) => { if let Some(p) = self.projects.get_mut(idx) { p.name.push(c); } }
+                KeyCode::Enter | KeyCode::Esc => {
+                    self.renaming_project = None;
+                    self.save_active_project().ok();
+                }
+                KeyCode::Backspace => {
+                    if let Some(p) = self.projects.get_mut(idx) {
+                        p.name.pop();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if let Some(p) = self.projects.get_mut(idx) {
+                        p.name.push(c);
+                    }
+                }
                 _ => {}
             }
             return;
@@ -511,24 +558,32 @@ impl App {
 
         if self.selecting_prompt {
             match key.code {
-                KeyCode::Esc => { self.selecting_prompt = false; }
-                KeyCode::Enter => { 
-                    if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT) {
+                KeyCode::Esc => {
+                    self.selecting_prompt = false;
+                }
+                KeyCode::Enter => {
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        || key.modifiers.contains(KeyModifiers::ALT)
+                    {
                         if let Some(id) = &self.active_project_id {
                             let p = self.projects.iter_mut().find(|p| p.id == *id).unwrap();
-                            if p.prompt.is_none() { p.prompt = Some(self.global_prompt.clone()); }
+                            if p.prompt.is_none() {
+                                p.prompt = Some(self.global_prompt.clone());
+                            }
                             p.prompt.as_mut().unwrap().push('\n');
                         } else {
                             self.global_prompt.push('\n');
                         }
                     } else {
-                        self.selecting_prompt = false; 
+                        self.selecting_prompt = false;
                     }
                 }
                 KeyCode::Backspace => {
                     if let Some(id) = &self.active_project_id {
                         let p = self.projects.iter_mut().find(|p| p.id == *id).unwrap();
-                        if p.prompt.is_none() { p.prompt = Some(self.global_prompt.clone()); }
+                        if p.prompt.is_none() {
+                            p.prompt = Some(self.global_prompt.clone());
+                        }
                         p.prompt.as_mut().unwrap().pop();
                     } else {
                         self.global_prompt.pop();
@@ -537,7 +592,9 @@ impl App {
                 KeyCode::Char(c) => {
                     if let Some(id) = &self.active_project_id {
                         let p = self.projects.iter_mut().find(|p| p.id == *id).unwrap();
-                        if p.prompt.is_none() { p.prompt = Some(self.global_prompt.clone()); }
+                        if p.prompt.is_none() {
+                            p.prompt = Some(self.global_prompt.clone());
+                        }
                         p.prompt.as_mut().unwrap().push(c);
                     } else {
                         self.global_prompt.push(c);
@@ -549,24 +606,34 @@ impl App {
         }
 
         match (key.code, key.modifiers) {
-            (KeyCode::Tab, _) => { self.next_tab(); return; }
-            (KeyCode::BackTab, _) => { self.prev_tab(); return; }
+            (KeyCode::Tab, _) => {
+                self.next_tab();
+                return;
+            }
+            (KeyCode::BackTab, _) => {
+                self.prev_tab();
+                return;
+            }
             (KeyCode::Char('n'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.new_session();
                 return;
             }
             (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
-                    if self.selecting_session {
-                        if let Some(idx) = self.hovered_session {
-                            if idx < self.sessions.len() { self.renaming_session = Some(idx); }
+                if self.selecting_session {
+                    if let Some(idx) = self.hovered_session {
+                        if idx < self.sessions.len() {
+                            self.renaming_session = Some(idx);
                         }
-                    } else if self.selecting_settings {
-                        self.editing_profile = true;
-                        self.profile_field_index = 0;
-                    } else if self.selecting_project {
-                        if let Some(idx) = self.hovered_project {
-                            if idx > 0 && idx <= self.projects.len() { self.renaming_project = Some(idx - 1); }
+                    }
+                } else if self.selecting_settings {
+                    self.editing_profile = true;
+                    self.profile_field_index = 0;
+                } else if self.selecting_project {
+                    if let Some(idx) = self.hovered_project {
+                        if idx > 0 && idx <= self.projects.len() {
+                            self.renaming_project = Some(idx - 1);
                         }
+                    }
                 } else {
                     self.renaming_session = Some(self.active_tab);
                 }
@@ -574,23 +641,54 @@ impl App {
             }
             _ => {}
         }
-        if self.active_session_pending() { return; }
+        if self.active_session_pending() {
+            return;
+        }
         match (key.code, key.modifiers) {
-            (KeyCode::PageUp, _) => { if let Some(s) = self.sessions.get_mut(self.active_tab) { s.scroll = s.scroll.saturating_sub(1); } return; }
-            (KeyCode::PageDown, _) => { if let Some(s) = self.sessions.get_mut(self.active_tab) { s.scroll = s.scroll.saturating_add(1); } return; }
+            (KeyCode::PageUp, _) => {
+                if let Some(s) = self.sessions.get_mut(self.active_tab) {
+                    s.scroll = s.scroll.saturating_sub(1);
+                }
+                return;
+            }
+            (KeyCode::PageDown, _) => {
+                if let Some(s) = self.sessions.get_mut(self.active_tab) {
+                    s.scroll = s.scroll.saturating_add(1);
+                }
+                return;
+            }
             (KeyCode::Enter, _) => self.submit(),
-            (KeyCode::Backspace, _) => { if let Some(s) = self.sessions.get_mut(self.active_tab) { s.input.pop(); } }
-            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => { if let Some(s) = self.sessions.get_mut(self.active_tab) { s.input.push(c); } }
+            (KeyCode::Backspace, _) => {
+                if let Some(s) = self.sessions.get_mut(self.active_tab) {
+                    s.input.pop();
+                }
+            }
+            (KeyCode::Char(c), m)
+                if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(s) = self.sessions.get_mut(self.active_tab) {
+                    s.input.push(c);
+                }
+            }
             _ => {}
         }
     }
 
-    pub fn active_session_pending(&self) -> bool { self.sessions.get(self.active_tab).map(|s| s.pending).unwrap_or(false) }
+    pub fn active_session_pending(&self) -> bool {
+        self.sessions
+            .get(self.active_tab)
+            .map(|s| s.pending)
+            .unwrap_or(false)
+    }
 
     pub fn submit(&mut self) {
-        let Some(session) = self.sessions.get_mut(self.active_tab) else { return; };
+        let Some(session) = self.sessions.get_mut(self.active_tab) else {
+            return;
+        };
         let text = session.input.trim().to_string();
-        if text.is_empty() { return; }
+        if text.is_empty() {
+            return;
+        }
         if text == "/new" {
             session.input.clear();
             self.new_session();
@@ -598,27 +696,50 @@ impl App {
         }
         let turn_id = Uuid::new_v4().to_string();
         session.input.clear();
-        session.messages.push(Message { role: Role::User, body: text, tool_calls: None });
-        session.messages.push(Message { role: Role::Assistant, body: String::new(), tool_calls: None });
+        session.messages.push(Message {
+            role: Role::User,
+            body: text,
+            tool_calls: None,
+        });
+        session.messages.push(Message {
+            role: Role::Assistant,
+            body: String::new(),
+            tool_calls: None,
+        });
         session.pending = true;
         session.pending_turn_id = Some(turn_id.clone());
         session.pending_project_id = self.active_project_id.clone();
         session.turn_steps.clear();
         let session_id = session.id.clone();
-        let mut messages: Vec<ProviderMessage> = session.messages.iter()
-            .filter(|m| !(matches!(m.role, Role::Assistant) && m.body.is_empty() && m.tool_calls.is_none()))
-            .map(|m| ProviderMessage { 
-                role: m.role, 
-                content: m.body.clone(), 
-                tool_calls: m.tool_calls.clone() 
-            }).collect();
-        messages.retain(|m| !m.content.is_empty() || matches!(m.role, Role::Assistant) || m.tool_calls.is_some());
-        
-        let board = self.active_project_id.as_ref()
-            .and_then(|id| self.projects.iter().find(|p| p.id == *id).map(|p| p.board.clone()));
-        
+        let mut messages: Vec<ProviderMessage> = session
+            .messages
+            .iter()
+            .filter(|m| {
+                !(matches!(m.role, Role::Assistant) && m.body.is_empty() && m.tool_calls.is_none())
+            })
+            .map(|m| ProviderMessage {
+                role: m.role,
+                content: m.body.clone(),
+                tool_calls: m.tool_calls.clone(),
+            })
+            .collect();
+        messages.retain(|m| {
+            !m.content.is_empty() || matches!(m.role, Role::Assistant) || m.tool_calls.is_some()
+        });
+
+        let board = self.active_project_id.as_ref().and_then(|id| {
+            self.projects
+                .iter()
+                .find(|p| p.id == *id)
+                .map(|p| p.board.clone())
+        });
+
         let custom_prompt = if let Some(id) = &self.active_project_id {
-            self.projects.iter().find(|p| p.id == *id).and_then(|p| p.prompt.clone()).or(Some(self.global_prompt.clone()))
+            self.projects
+                .iter()
+                .find(|p| p.id == *id)
+                .and_then(|p| p.prompt.clone())
+                .or(Some(self.global_prompt.clone()))
         } else {
             Some(self.global_prompt.clone())
         };
@@ -631,9 +752,12 @@ impl App {
             custom_prompt,
             agent: AgentKind::Orchestrator,
         };
-        let _ = self.worker_tx.send(WorkerCmd::Send { turn_id, session_id, request });
-        if self.active_project_id.is_some() { self.save_active_project().ok(); }
-        else { self.save_active_session().ok(); }
+        let _ = self.worker_tx.send(WorkerCmd::Send {
+            turn_id,
+            session_id,
+            request,
+        });
+        self.save_current_scope();
         self.scroll_to_bottom();
     }
 
@@ -694,15 +818,27 @@ impl App {
     pub fn drain_worker_events(&mut self) {
         while let Ok(ev) = self.worker_rx.try_recv() {
             match ev {
-                WorkerEvent::Delta { session_id, turn_id, delta } => {
+                WorkerEvent::Delta {
+                    session_id,
+                    turn_id,
+                    delta,
+                } => {
                     if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
-                        if let Some(last_assistant) = s.messages.iter_mut().rev().find(|m| matches!(m.role, Role::Assistant)) {
+                        if let Some(last_assistant) = s
+                            .messages
+                            .iter_mut()
+                            .rev()
+                            .find(|m| matches!(m.role, Role::Assistant))
+                        {
                             last_assistant.body.push_str(&delta);
                             self.scroll_to_bottom();
                         }
                     }
                 }
-                WorkerEvent::Done { session_id, turn_id } => {
+                WorkerEvent::Done {
+                    session_id,
+                    turn_id,
+                } => {
                     let mut project_to_save = None;
                     if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
                         project_to_save = s.pending_project_id.clone();
@@ -712,21 +848,49 @@ impl App {
                     }
                     self.save_after_event(project_to_save.as_deref(), &session_id);
                 }
-                WorkerEvent::SystemNote { session_id, turn_id, note } => {
+                WorkerEvent::SystemNote {
+                    session_id,
+                    turn_id,
+                    note,
+                } => {
                     if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
-                        if s.pending { self.tool_status = Some(note); }
+                        if s.pending {
+                            self.tool_status = Some(note);
+                        }
                     }
                 }
-                WorkerEvent::ToolStatus { session_id, turn_id, status } => {
+                WorkerEvent::ToolStatus {
+                    session_id,
+                    turn_id,
+                    status,
+                } => {
                     if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
-                        if s.pending { self.tool_status = Some(status); }
+                        if s.pending {
+                            self.tool_status = Some(status);
+                        }
                     }
                 }
-                WorkerEvent::ToolCalls { session_id, turn_id, calls } => {
+                WorkerEvent::ToolCalls {
+                    session_id,
+                    turn_id,
+                    calls,
+                } => {
                     if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
-                        if let Some(last_assistant) = s.messages.iter_mut().rev().find(|m| matches!(m.role, Role::Assistant)) {
-                            let has_args = calls.as_array()
-                                .map(|a| a.iter().any(|c| !c.pointer("/function/arguments").unwrap_or(&serde_json::Value::Null).is_null()))
+                        if let Some(last_assistant) = s
+                            .messages
+                            .iter_mut()
+                            .rev()
+                            .find(|m| matches!(m.role, Role::Assistant))
+                        {
+                            let has_args = calls
+                                .as_array()
+                                .map(|a| {
+                                    a.iter().any(|c| {
+                                        !c.pointer("/function/arguments")
+                                            .unwrap_or(&serde_json::Value::Null)
+                                            .is_null()
+                                    })
+                                })
                                 .unwrap_or(false);
 
                             if last_assistant.tool_calls.is_none() || has_args {
@@ -736,39 +900,49 @@ impl App {
                         self.scroll_to_bottom();
                     }
                 }
-                WorkerEvent::PhaseChange { session_id, turn_id, phase } => {
+                WorkerEvent::PhaseChange {
+                    session_id,
+                    turn_id,
+                    phase,
+                } => {
                     if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
-                        upsert_turn_step(
-                            &mut s.turn_steps,
-                            phase,
-                            TurnStepStatus::Running,
-                            None,
-                        );
-                        self.tool_status = Some(match phase {
-                            AgentPhase::Plan => "planning...".into(),
-                            AgentPhase::Explore => "exploring...".into(),
-                            AgentPhase::Act => "executing...".into(),
-                            AgentPhase::Verify => "verifying...".into(),
-                            AgentPhase::Respond => "responding...".into(),
-                        });
+                        upsert_turn_step(&mut s.turn_steps, phase, TurnStepStatus::Running, None);
+                        self.set_phase_status(phase);
                     }
                 }
-                WorkerEvent::StepUpdate { session_id, turn_id, phase, status, summary } => {
+                WorkerEvent::StepUpdate {
+                    session_id,
+                    turn_id,
+                    phase,
+                    status,
+                    summary,
+                } => {
                     if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
                         upsert_turn_step(&mut s.turn_steps, phase, status, summary);
                     }
                 }
-                WorkerEvent::StepArtifact { session_id, turn_id, phase, artifact } => {
+                WorkerEvent::StepArtifact {
+                    session_id,
+                    turn_id,
+                    phase,
+                    artifact,
+                } => {
                     if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
                         append_turn_artifact(&mut s.turn_steps, phase, artifact);
                     }
                 }
-                WorkerEvent::BoardUpdate { session_id, turn_id, project_id, operations } => {
+                WorkerEvent::BoardUpdate {
+                    session_id,
+                    turn_id,
+                    project_id,
+                    operations,
+                } => {
                     if self.session_for_turn_mut(&session_id, &turn_id).is_none() {
                         continue;
                     }
                     if let Some(project_id) = project_id {
-                        if let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id) {
+                        if let Some(project) = self.projects.iter_mut().find(|p| p.id == project_id)
+                        {
                             project.board.apply_operations(&operations);
                             self.save_project_by_id(&project_id).ok();
                         }
@@ -781,7 +955,12 @@ impl App {
                     }
                     self.save_after_event(project_to_save.as_deref(), &session_id);
                 }
-                WorkerEvent::JobUpdated { session_id, job_id, status, summary } => {
+                WorkerEvent::JobUpdated {
+                    session_id,
+                    job_id,
+                    status,
+                    summary,
+                } => {
                     let mut project_to_save = None;
                     if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                         if let Some(job) = session.jobs.iter_mut().find(|job| job.id == job_id) {
@@ -790,14 +969,21 @@ impl App {
                             project_to_save = job.project_id.clone();
                         }
                         if matches!(status, JobStatus::Running) {
-                            self.tool_status = Some(format!("background job: {}", job_id.chars().take(8).collect::<String>()));
+                            self.tool_status = Some(format!(
+                                "background job: {}",
+                                job_id.chars().take(8).collect::<String>()
+                            ));
                         } else if matches!(status, JobStatus::Completed | JobStatus::Failed) {
                             self.jobs_flash_until = self.frame_count.saturating_add(36);
                         }
                     }
                     self.save_after_event(project_to_save.as_deref(), &session_id);
                 }
-                WorkerEvent::JobMessage { session_id, job_id, content } => {
+                WorkerEvent::JobMessage {
+                    session_id,
+                    job_id,
+                    content,
+                } => {
                     let mut project_to_save = None;
                     if let Some(session) = self.sessions.iter_mut().find(|s| s.id == session_id) {
                         let message = session
@@ -825,13 +1011,24 @@ impl App {
                     }
                     self.save_after_event(project_to_save.as_deref(), &session_id);
                 }
-                WorkerEvent::Error { session_id, turn_id, err } => {
+                WorkerEvent::Error {
+                    session_id,
+                    turn_id,
+                    err,
+                } => {
                     let mut project_to_save = None;
                     if let Some(s) = self.session_for_turn_mut(&session_id, &turn_id) {
                         project_to_save = s.pending_project_id.clone();
                         if let Some(last) = s.messages.last_mut() {
-                            if matches!(last.role, Role::Assistant) && last.body.is_empty() { last.body = format!("[error] {}", err); }
-                            else { s.messages.push(Message { role: Role::Assistant, body: format!("[error] {}", err), tool_calls: None }); }
+                            if matches!(last.role, Role::Assistant) && last.body.is_empty() {
+                                last.body = format!("[error] {}", err);
+                            } else {
+                                s.messages.push(Message {
+                                    role: Role::Assistant,
+                                    body: format!("[error] {}", err),
+                                    tool_calls: None,
+                                });
+                            }
                         }
                         Self::finalize_session_turn(s);
                         self.tool_status = None;
@@ -843,17 +1040,22 @@ impl App {
         }
     }
 
-    pub fn switch_session(&mut self, idx: usize) { 
-        self.active_tab = idx; 
-        self.active_session_id = self.sessions.get(idx).map(|s| s.id.clone());
-        self.selecting_session = false; 
-        self.scroll_to_bottom(); 
+    pub fn switch_session(&mut self, idx: usize) {
+        self.sync_active_session(idx);
+        self.selecting_session = false;
+        self.scroll_to_bottom();
     }
 
     pub fn handle_mouse(&mut self, me: MouseEvent) {
         let pos = Position::new(me.column, me.row);
         match me.kind {
-            MouseEventKind::Moved | MouseEventKind::Drag(_) => { self.hovered_menu = self.menu_hit(pos); self.hovered_settings = self.settings_hit(pos); self.hovered_profile = self.profile_hit(pos); self.hovered_project = self.project_hit(pos); self.hovered_session = self.session_hit(pos); }
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                self.hovered_menu = self.menu_hit(pos);
+                self.hovered_settings = self.settings_hit(pos);
+                self.hovered_profile = self.profile_hit(pos);
+                self.hovered_project = self.project_hit(pos);
+                self.hovered_session = self.session_hit(pos);
+            }
             MouseEventKind::Down(btn) => {
                 if btn == MouseButton::Left {
                     // Overlays first
@@ -880,11 +1082,13 @@ impl App {
                     }
                     if self.selecting_project {
                         if let Some(idx) = self.project_hit(pos) {
-                            if idx == 0 { let _ = self.switch_project(None); }
-                            else if idx == self.projects.len() + 1 { let _ = self.new_project(); }
-                            else { 
+                            if idx == 0 {
+                                let _ = self.switch_project(None);
+                            } else if idx == self.projects.len() + 1 {
+                                let _ = self.new_project();
+                            } else {
                                 let project_id = self.projects[idx - 1].id.clone();
-                                let _ = self.switch_project(Some(project_id)); 
+                                let _ = self.switch_project(Some(project_id));
                             }
                             self.selecting_project = false;
                             return;
@@ -892,66 +1096,139 @@ impl App {
                     }
                     if self.selecting_session {
                         if let Some(idx) = self.session_hit(pos) {
-                            if idx == self.sessions.len() { self.new_session(); }
-                            else { self.switch_session(idx); }
+                            if idx == self.sessions.len() {
+                                self.new_session();
+                            } else {
+                                self.switch_session(idx);
+                            }
                             return;
                         }
                     }
 
-                    if let Some(action) = self.menu_hit(pos) { self.pressed_menu = Some(action); return; }
-                    if let Some(idx) = self.tab_hit(pos) { 
-                        self.active_tab = idx; 
-                        self.active_session_id = self.sessions.get(idx).map(|s| s.id.clone());
+                    if let Some(action) = self.menu_hit(pos) {
+                        self.pressed_menu = Some(action);
+                        return;
+                    }
+                    if let Some(idx) = self.tab_hit(pos) {
+                        self.sync_active_session(idx);
                         return;
                     }
                 } else if btn == MouseButton::Right {
                     if self.selecting_session {
                         if let Some(idx) = self.session_hit(pos) {
-                            if idx < self.sessions.len() { self.delete_session(idx); return; }
+                            if idx < self.sessions.len() {
+                                self.delete_session(idx);
+                                return;
+                            }
                         }
                     }
-                    if let Some(idx) = self.tab_hit(pos) { self.close_session(idx); return; }
+                    if let Some(idx) = self.tab_hit(pos) {
+                        self.close_session(idx);
+                        return;
+                    }
                 }
             }
-            MouseEventKind::Up(MouseButton::Left) => { if let Some(pressed) = self.pressed_menu.take() { if self.menu_hit(pos) == Some(pressed) { self.fire_menu(pressed); } } }
-            MouseEventKind::ScrollUp => { if let Some(s) = self.sessions.get_mut(self.active_tab) { s.scroll = s.scroll.saturating_sub(1); } }
-            MouseEventKind::ScrollDown => { if let Some(s) = self.sessions.get_mut(self.active_tab) { s.scroll = s.scroll.saturating_add(1); } }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(pressed) = self.pressed_menu.take() {
+                    if self.menu_hit(pos) == Some(pressed) {
+                        self.fire_menu(pressed);
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(s) = self.sessions.get_mut(self.active_tab) {
+                    s.scroll = s.scroll.saturating_sub(1);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(s) = self.sessions.get_mut(self.active_tab) {
+                    s.scroll = s.scroll.saturating_add(1);
+                }
+            }
             _ => {}
         }
     }
 
-    pub fn menu_hit(&self, p: Position) -> Option<MenuAction> { self.menu_hits.iter().find(|(r, _)| r.contains(p)).map(|(_, a)| *a) }
-    pub fn tab_hit(&self, p: Position) -> Option<usize> { self.tab_hits.iter().find(|(r, _)| r.contains(p)).map(|(_, i)| *i) }
-    pub fn settings_hit(&self, p: Position) -> Option<usize> { self.settings_hits.iter().find(|(r, _)| r.contains(p)).map(|(_, i)| *i) }
-    pub fn profile_hit(&self, p: Position) -> Option<usize> { self.profile_hits.iter().find(|(r, _)| r.contains(p)).map(|(_, i)| *i) }
-    pub fn project_hit(&self, p: Position) -> Option<usize> { self.project_hits.iter().find(|(r, _)| r.contains(p)).map(|(_, i)| *i) }
-    pub fn session_hit(&self, p: Position) -> Option<usize> { self.session_hits.iter().find(|(r, _)| r.contains(p)).map(|(_, i)| *i) }
+    pub fn menu_hit(&self, p: Position) -> Option<MenuAction> {
+        self.menu_hits
+            .iter()
+            .find(|(r, _)| r.contains(p))
+            .map(|(_, a)| *a)
+    }
+    pub fn tab_hit(&self, p: Position) -> Option<usize> {
+        self.tab_hits
+            .iter()
+            .find(|(r, _)| r.contains(p))
+            .map(|(_, i)| *i)
+    }
+    pub fn settings_hit(&self, p: Position) -> Option<usize> {
+        self.settings_hits
+            .iter()
+            .find(|(r, _)| r.contains(p))
+            .map(|(_, i)| *i)
+    }
+    pub fn profile_hit(&self, p: Position) -> Option<usize> {
+        self.profile_hits
+            .iter()
+            .find(|(r, _)| r.contains(p))
+            .map(|(_, i)| *i)
+    }
+    pub fn project_hit(&self, p: Position) -> Option<usize> {
+        self.project_hits
+            .iter()
+            .find(|(r, _)| r.contains(p))
+            .map(|(_, i)| *i)
+    }
+    pub fn session_hit(&self, p: Position) -> Option<usize> {
+        self.session_hits
+            .iter()
+            .find(|(r, _)| r.contains(p))
+            .map(|(_, i)| *i)
+    }
 
     pub fn fire_menu(&mut self, action: MenuAction) {
         match action {
             MenuAction::Quit => self.running = false,
-            MenuAction::Settings => { self.selecting_settings = !self.selecting_settings; self.selecting_project = false; self.selecting_session = false; self.selecting_prompt = false; }
-            MenuAction::Projects => { self.selecting_project = !self.selecting_project; if self.selecting_project { self.load_projects().ok(); } self.selecting_settings = false; self.selecting_session = false; self.selecting_prompt = false; }
-            MenuAction::Prompt => { self.selecting_prompt = !self.selecting_prompt; self.selecting_settings = false; self.selecting_project = false; self.selecting_session = false; }
+            MenuAction::Settings => {
+                self.selecting_settings = !self.selecting_settings;
+                self.selecting_project = false;
+                self.selecting_session = false;
+                self.selecting_prompt = false;
+            }
+            MenuAction::Projects => {
+                self.selecting_project = !self.selecting_project;
+                if self.selecting_project {
+                    self.load_projects().ok();
+                }
+                self.selecting_settings = false;
+                self.selecting_session = false;
+                self.selecting_prompt = false;
+            }
+            MenuAction::Prompt => {
+                self.selecting_prompt = !self.selecting_prompt;
+                self.selecting_settings = false;
+                self.selecting_project = false;
+                self.selecting_session = false;
+            }
             _ => {}
         }
     }
 
-    pub fn next_tab(&mut self) { 
-        if !self.sessions.is_empty() { 
-            self.active_tab = (self.active_tab + 1) % self.sessions.len(); 
-            self.active_session_id = self.sessions.get(self.active_tab).map(|s| s.id.clone());
-        } 
+    pub fn next_tab(&mut self) {
+        if !self.sessions.is_empty() {
+            self.sync_active_session((self.active_tab + 1) % self.sessions.len());
+        }
     }
-    pub fn prev_tab(&mut self) { 
-        if !self.sessions.is_empty() { 
-            let n = self.sessions.len(); 
-            self.active_tab = (self.active_tab + n - 1) % n; 
-            self.active_session_id = self.sessions.get(self.active_tab).map(|s| s.id.clone());
-        } 
+    pub fn prev_tab(&mut self) {
+        if !self.sessions.is_empty() {
+            let n = self.sessions.len();
+            self.sync_active_session((self.active_tab + n - 1) % n);
+        }
     }
 
-    pub fn is_running(&self) -> bool { self.running }
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
 }
 
 fn upsert_turn_step(
@@ -976,11 +1253,7 @@ fn upsert_turn_step(
     });
 }
 
-fn append_turn_artifact(
-    steps: &mut Vec<TurnStep>,
-    phase: AgentPhase,
-    artifact: ExecutionArtifact,
-) {
+fn append_turn_artifact(steps: &mut Vec<TurnStep>, phase: AgentPhase, artifact: ExecutionArtifact) {
     if let Some(step) = steps.iter_mut().find(|step| step.phase == phase) {
         step.artifacts.push(artifact);
         return;

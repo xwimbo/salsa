@@ -73,8 +73,7 @@ pub fn bootstrap() -> Result<(Config, Paths)> {
         &paths.sessions,
         &paths.agents,
     ] {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("creating {}", dir.display()))?;
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
 
     let config = if paths.config_file.exists() {

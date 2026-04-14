@@ -114,11 +114,32 @@ impl Provider for CodexProvider {
     ) {
         match request.agent {
             AgentKind::Coder => {
-                if let Err(err) = run_coder_turn(
+                if let Err(err) = run_specialist_turn(
                     &self.auth,
                     &self.client,
                     &self.sandbox,
                     request,
+                    AgentKind::Coder,
+                    "coder",
+                    session_id.clone(),
+                    turn_id.clone(),
+                    tx,
+                ) {
+                    let _ = tx.send(WorkerEvent::Error {
+                        session_id,
+                        turn_id,
+                        err: err.to_string(),
+                    });
+                }
+            }
+            AgentKind::Analyst => {
+                if let Err(err) = run_specialist_turn(
+                    &self.auth,
+                    &self.client,
+                    &self.sandbox,
+                    request,
+                    AgentKind::Analyst,
+                    "analyst",
                     session_id.clone(),
                     turn_id.clone(),
                     tx,
@@ -147,64 +168,79 @@ impl Provider for CodexProvider {
                     });
                 }
             }
-            AgentKind::Orchestrator => {
-                match route_request(request) {
-                    RouteDecision::Direct => {
-                        if let Err(err) = stream_text_response(
-                            &self.auth,
-                            &self.client,
-                            request,
-                            session_id.clone(),
-                            turn_id.clone(),
-                            tx,
-                            orchestrator_instructions(request),
-                        ) {
-                            let _ = tx.send(WorkerEvent::Error {
-                                session_id,
-                                turn_id,
-                                err: err.to_string(),
-                            });
-                        }
-                    }
-                    RouteDecision::Planner => {
-                        if let Err(err) = stream_text_response(
-                            &self.auth,
-                            &self.client,
-                            request,
-                            session_id.clone(),
-                            turn_id.clone(),
-                            tx,
-                            planner_instructions(request),
-                        ) {
-                            let _ = tx.send(WorkerEvent::Error {
-                                session_id,
-                                turn_id,
-                                err: err.to_string(),
-                            });
-                        }
-                    }
-                    RouteDecision::Coder => {
-                        spawn_background_coder(
-                            &self.auth,
-                            &self.client,
-                            &self.sandbox,
-                            request,
+            AgentKind::Orchestrator => match route_request(request) {
+                RouteDecision::Direct => {
+                    if let Err(err) = stream_text_response(
+                        &self.auth,
+                        &self.client,
+                        request,
+                        session_id.clone(),
+                        turn_id.clone(),
+                        tx,
+                        orchestrator_instructions(request),
+                    ) {
+                        let _ = tx.send(WorkerEvent::Error {
                             session_id,
                             turn_id,
-                            tx,
-                        );
+                            err: err.to_string(),
+                        });
                     }
                 }
-            }
+                RouteDecision::Planner => {
+                    if let Err(err) = stream_text_response(
+                        &self.auth,
+                        &self.client,
+                        request,
+                        session_id.clone(),
+                        turn_id.clone(),
+                        tx,
+                        planner_instructions(request),
+                    ) {
+                        let _ = tx.send(WorkerEvent::Error {
+                            session_id,
+                            turn_id,
+                            err: err.to_string(),
+                        });
+                    }
+                }
+                RouteDecision::Analyst => {
+                    spawn_background_specialist(
+                        &self.auth,
+                        &self.client,
+                        &self.sandbox,
+                        request,
+                        AgentKind::Analyst,
+                        "data analysis",
+                        session_id,
+                        turn_id,
+                        tx,
+                    );
+                }
+                RouteDecision::Coder => {
+                    spawn_background_specialist(
+                        &self.auth,
+                        &self.client,
+                        &self.sandbox,
+                        request,
+                        AgentKind::Coder,
+                        "coding",
+                        session_id,
+                        turn_id,
+                        tx,
+                    );
+                }
+            },
         }
     }
 }
 
-fn spawn_background_coder(
+fn spawn_background_specialist(
     auth: &CodexAuth,
     client: &CodexClient,
     sandbox: &Sandbox,
     request: &ProviderRequest,
+    agent: AgentKind,
+    initial_summary: &str,
     session_id: String,
     turn_id: String,
     tx: &Sender<WorkerEvent>,
@@ -212,7 +248,7 @@ fn spawn_background_coder(
     let job_id = Uuid::new_v4().to_string();
     let job = BackgroundJob {
         id: job_id.clone(),
-        agent: AgentKind::Coder,
+        agent,
         title: summarize_job_title(request),
         status: JobStatus::Queued,
         project_id: request.project_id.clone(),
@@ -223,17 +259,22 @@ fn spawn_background_coder(
         job: job.clone(),
     });
 
+    let initial_summary = initial_summary.to_string();
+
     let _ = tx.send(WorkerEvent::Delta {
         session_id: session_id.clone(),
         turn_id: turn_id.clone(),
-        delta: "I started a coding worker in the background. I’ll keep the conversation here and report back when it finishes.".to_string(),
+        delta: format!(
+            "I started a {} worker in the background. I’ll keep the conversation here and report back when it finishes.",
+            initial_summary
+        ),
     });
 
     let auth = auth.clone();
     let client = client.clone();
     let sandbox = sandbox.clone();
-    let mut coder_request = request.clone();
-    coder_request.agent = AgentKind::Coder;
+    let mut specialist_request = request.clone();
+    specialist_request.agent = agent;
     let session_id_for_job = session_id.clone();
     let tx_for_job = tx.clone();
     thread::spawn(move || {
@@ -241,14 +282,14 @@ fn spawn_background_coder(
             session_id: session_id_for_job.clone(),
             job_id: job_id.clone(),
             status: JobStatus::Running,
-            summary: "coding...".to_string(),
+            summary: format!("{}...", initial_summary),
         });
 
-        match run_background_coder_job(
+        match run_background_specialist_job(
             &auth,
             &client,
             &sandbox,
-            &coder_request,
+            &specialist_request,
             session_id_for_job.clone(),
             job_id.clone(),
             &tx_for_job,
@@ -276,13 +317,16 @@ fn spawn_background_coder(
                 let _ = tx_for_job.send(WorkerEvent::JobMessage {
                     session_id: session_id_for_job,
                     job_id,
-                    content: format!("[background coder error] {}", err),
+                    content: format!("[background {} error] {}", initial_summary, err),
                 });
             }
         }
     });
 
-    let _ = tx.send(WorkerEvent::Done { session_id, turn_id });
+    let _ = tx.send(WorkerEvent::Done {
+        session_id,
+        turn_id,
+    });
 }
 
 fn stream_text_response(
@@ -308,26 +352,43 @@ fn stream_text_response(
     });
 
     client.request(auth, &body, session_id.clone(), turn_id.clone(), true, tx)?;
-    let _ = tx.send(WorkerEvent::Done { session_id, turn_id });
+    let _ = tx.send(WorkerEvent::Done {
+        session_id,
+        turn_id,
+    });
     Ok(())
 }
 
-fn run_coder_turn(
+fn run_specialist_turn(
     auth: &CodexAuth,
     client: &CodexClient,
     sandbox: &Sandbox,
     request: &ProviderRequest,
+    agent: AgentKind,
+    label: &str,
     session_id: String,
     turn_id: String,
     tx: &Sender<WorkerEvent>,
 ) -> Result<()> {
-    let summary = run_coder_loop(auth, client, sandbox, request, Some((&session_id, &turn_id, tx)), None)?;
+    let summary = run_specialist_loop(
+        auth,
+        client,
+        sandbox,
+        request,
+        agent,
+        label,
+        Some((&session_id, &turn_id, tx)),
+        None,
+    )?;
     let _ = summary;
-    let _ = tx.send(WorkerEvent::Done { session_id, turn_id });
+    let _ = tx.send(WorkerEvent::Done {
+        session_id,
+        turn_id,
+    });
     Ok(())
 }
 
-fn run_background_coder_job(
+fn run_background_specialist_job(
     auth: &CodexAuth,
     client: &CodexClient,
     sandbox: &Sandbox,
@@ -336,24 +397,44 @@ fn run_background_coder_job(
     job_id: String,
     tx: &Sender<WorkerEvent>,
 ) -> Result<String> {
-    run_coder_loop(auth, client, sandbox, request, None, Some((&session_id, &job_id, tx)))
+    run_specialist_loop(
+        auth,
+        client,
+        sandbox,
+        request,
+        request.agent,
+        match request.agent {
+            AgentKind::Coder => "coder",
+            AgentKind::Analyst => "analyst",
+            AgentKind::Orchestrator => "orchestrator",
+            AgentKind::Planner => "planner",
+        },
+        None,
+        Some((&session_id, &job_id, tx)),
+    )
 }
 
-fn run_coder_loop(
+fn run_specialist_loop(
     auth: &CodexAuth,
     client: &CodexClient,
     sandbox: &Sandbox,
     request: &ProviderRequest,
+    agent: AgentKind,
+    label: &str,
     interactive_turn: Option<(&str, &str, &Sender<WorkerEvent>)>,
     background_job: Option<(&str, &str, &Sender<WorkerEvent>)>,
 ) -> Result<String> {
     let mut conversation = request.messages.clone();
-    let mut board = request.board.clone().unwrap_or_default().normalized_for_prompt();
+    let mut board = request
+        .board
+        .clone()
+        .unwrap_or_default()
+        .normalized_for_prompt();
     let mut total_tool_calls = 0u32;
     let mut continuation_frames: Vec<ContinuationFrame> = Vec::new();
     let mut final_response = String::new();
 
-    for &phase in phases_for_turn(true) {
+    for phase in AgentPhase::ALL {
         if let Some((session_id, turn_id, tx)) = interactive_turn {
             let _ = tx.send(WorkerEvent::PhaseChange {
                 session_id: session_id.to_string(),
@@ -365,12 +446,12 @@ fn run_coder_loop(
                 turn_id: turn_id.to_string(),
                 phase,
                 status: TurnStepStatus::Running,
-                summary: Some(phase_status(phase).to_string()),
+                summary: Some(phase.status().to_string()),
             });
             let _ = tx.send(WorkerEvent::ToolStatus {
                 session_id: session_id.to_string(),
                 turn_id: turn_id.to_string(),
-                status: phase_status(phase).to_string(),
+                status: phase.status().to_string(),
             });
         }
         if let Some((session_id, job_id, tx)) = background_job {
@@ -378,7 +459,7 @@ fn run_coder_loop(
                 session_id: session_id.to_string(),
                 job_id: job_id.to_string(),
                 status: JobStatus::Running,
-                summary: phase_status(phase).to_string(),
+                summary: phase.status().to_string(),
             });
         }
 
@@ -402,9 +483,13 @@ fn run_coder_loop(
                 .map(|m| m.as_json())
                 .collect();
 
-            let instructions = build_coder_instructions(request, &board, phase);
-            let allowed_tools = tools::tool_specs_for_phase(phase);
-            let tool_choice = if allowed_tools.is_empty() { "none" } else { "auto" };
+            let instructions = build_specialist_instructions(request, &board, phase, agent, label);
+            let allowed_tools = tools::tool_specs_for_agent_phase(agent, phase);
+            let tool_choice = if allowed_tools.is_empty() {
+                "none"
+            } else {
+                "auto"
+            };
 
             let emit_text = matches!(phase, AgentPhase::Respond) && interactive_turn.is_some();
             let turn_key = interactive_turn
@@ -593,7 +678,12 @@ fn run_coder_loop(
                 }
             }
 
-            if should_advance_phase(phase, used_tools_this_iteration, iterations, phase_iterations) {
+            if should_advance_phase(
+                phase,
+                used_tools_this_iteration,
+                iterations,
+                phase_iterations,
+            ) {
                 break;
             }
         }
@@ -602,21 +692,55 @@ fn run_coder_loop(
     Ok(final_response.trim().to_string())
 }
 
-fn build_coder_instructions(
+fn build_specialist_instructions(
     request: &ProviderRequest,
     board: &Board,
     phase: AgentPhase,
+    agent: AgentKind,
+    label: &str,
 ) -> String {
+    let role_instructions = match agent {
+        AgentKind::Coder => {
+            "You are an expert software engineer assistant operating in a bounded phase loop.\n\
+            The workspace tools are the only valid way to inspect or modify files."
+        }
+        AgentKind::Analyst => {
+            "You are a specialized data analysis assistant operating in a bounded phase loop.\n\
+            Use the dataframe tools to inspect datasets, compute statistics, and validate findings.\n\
+            Do not modify workspace files or pretend to have run an analysis without a successful tool call."
+        }
+        _ => "You are a specialist assistant operating in a bounded phase loop.",
+    };
+    let phase_rules = match agent {
+        AgentKind::Analyst => match phase {
+            AgentPhase::Plan => {
+                "Use only board_update. Define the analysis goal, target dataset, and the next question to answer."
+            }
+            AgentPhase::Explore => {
+                "Inspect dataset files and gather evidence with read-only tools. Prefer dataframe inspection/statistics tools over guessing."
+            }
+            AgentPhase::Act => {
+                "Run dataframe operations to answer the active analysis question. Do not call write, edit, delete, or shell tools."
+            }
+            AgentPhase::Verify => {
+                "Cross-check findings with follow-up dataframe queries. Confirm assumptions such as nulls, row counts, and grouping logic."
+            }
+            AgentPhase::Respond => {
+                "Do not call tools. Give a concise user-facing analysis summary with evidence and caveats."
+            }
+        },
+        _ => phase.rules(),
+    };
     let mut instructions = format!(
-        "You are an expert software engineer assistant operating in a bounded phase loop.\n\
-        The workspace tools are the only valid way to inspect or modify files.\n\
+        "{role_instructions}\n\
         Never claim to have performed an action unless you actually called a tool and received success.\n\
         Use the board as authoritative planner state.\n\
+        Specialist label: {label}.\n\
         Current phase: {}.\n\
         Phase rules:\n{}\n\
         Board state:\n{}",
-        phase_name(phase),
-        phase_rules(phase),
+        phase.as_str(),
+        phase_rules,
         serde_yaml::to_string(board).unwrap_or_default()
     );
 
@@ -647,7 +771,7 @@ fn planner_instructions(request: &ProviderRequest) -> String {
         "You are a planning specialist.\n\
         Work with the user to flesh out a plan when scope is unclear.\n\
         Produce concrete implementation steps, risks, and verification ideas.\n\
-        Stay concise and actionable, and do not pretend work has already been executed."
+        Stay concise and actionable, and do not pretend work has already been executed.",
     );
     if let Some(ref custom) = request.custom_prompt {
         instructions.push_str("\nUser custom prompt:\n");
@@ -656,65 +780,12 @@ fn planner_instructions(request: &ProviderRequest) -> String {
     instructions
 }
 
-fn phase_name(phase: AgentPhase) -> &'static str {
-    match phase {
-        AgentPhase::Plan => "plan",
-        AgentPhase::Explore => "explore",
-        AgentPhase::Act => "act",
-        AgentPhase::Verify => "verify",
-        AgentPhase::Respond => "respond",
-    }
-}
-
-fn phase_rules(phase: AgentPhase) -> &'static str {
-    match phase {
-        AgentPhase::Plan => {
-            "Use only board_update. Set or refine the goal, summary, tasks, and current task before any work."
-        }
-        AgentPhase::Explore => {
-            "Gather evidence with read-only tools. Update the board with facts, blockers, and task state. Do not modify files."
-        }
-        AgentPhase::Act => {
-            "Execute the selected task. Prefer narrow edits. Record attempts and task status changes in the board."
-        }
-        AgentPhase::Verify => {
-            "Validate the work with focused reads or commands. Add evidence to the board and mark tasks done or blocked."
-        }
-        AgentPhase::Respond => {
-            "Do not call tools. Give a concise user-facing summary of what changed, what was verified, and what remains."
-        }
-    }
-}
-
-fn phase_status(phase: AgentPhase) -> &'static str {
-    match phase {
-        AgentPhase::Plan => "planning...",
-        AgentPhase::Explore => "exploring...",
-        AgentPhase::Act => "executing...",
-        AgentPhase::Verify => "verifying...",
-        AgentPhase::Respond => "responding...",
-    }
-}
-
-fn phases_for_turn(full_loop: bool) -> &'static [AgentPhase] {
-    if full_loop {
-        &[
-            AgentPhase::Plan,
-            AgentPhase::Explore,
-            AgentPhase::Act,
-            AgentPhase::Verify,
-            AgentPhase::Respond,
-        ]
-    } else {
-        &[AgentPhase::Respond]
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RouteDecision {
     Direct,
     Planner,
     Coder,
+    Analyst,
 }
 
 fn route_request(request: &ProviderRequest) -> RouteDecision {
@@ -731,42 +802,144 @@ fn route_request(request: &ProviderRequest) -> RouteDecision {
     }
 
     let direct_markers = [
-        "hi", "hello", "hey", "yo", "sup", "how are you", "what's up", "whats up",
-        "good morning", "good afternoon", "good evening", "thanks", "thank you", "cool",
-        "nice", "lol", "lmao",
+        "hi",
+        "hello",
+        "hey",
+        "yo",
+        "sup",
+        "how are you",
+        "what's up",
+        "whats up",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "thanks",
+        "thank you",
+        "cool",
+        "nice",
+        "lol",
+        "lmao",
     ];
     let planner_markers = [
-        "plan", "roadmap", "strategy", "approach", "design", "architecture", "way forward",
-        "break this down", "flesh out", "scope", "tradeoff", "trade-off", "what should we",
-        "how should we", "before we", "thinking through", "brainstorm",
+        "plan",
+        "roadmap",
+        "strategy",
+        "approach",
+        "design",
+        "architecture",
+        "way forward",
+        "break this down",
+        "flesh out",
+        "scope",
+        "tradeoff",
+        "trade-off",
+        "what should we",
+        "how should we",
+        "before we",
+        "thinking through",
+        "brainstorm",
+    ];
+    let analyst_markers = [
+        "dataframe",
+        "dataset",
+        "csv",
+        "parquet",
+        "polars",
+        "statistics",
+        "statistical",
+        "correlation",
+        "distribution",
+        "group by",
+        "groupby",
+        "aggregate",
+        "summary stats",
+        "descriptive stats",
+        "value counts",
+        "mean",
+        "median",
+        "outlier",
     ];
     let coder_markers = [
-        "fix", "build", "implement", "edit", "refactor", "debug", "investigate", "analyze",
-        "review", "search", "find", "open", "read", "write", "run", "create", "delete",
-        "change", "update", "add", "remove", "file", "function", "module", "cargo", "compile",
-        "failing", "broken", "bug", "error", "workspace", "repo", "codebase",
+        "fix",
+        "build",
+        "implement",
+        "edit",
+        "refactor",
+        "debug",
+        "investigate",
+        "review",
+        "search",
+        "find",
+        "open",
+        "read",
+        "write",
+        "run",
+        "create",
+        "delete",
+        "change",
+        "update",
+        "add",
+        "remove",
+        "file",
+        "function",
+        "module",
+        "cargo",
+        "compile",
+        "failing",
+        "broken",
+        "bug",
+        "error",
+        "workspace",
+        "repo",
+        "codebase",
     ];
     let coder_phrases = [
-        "run tests", "write code", "open the repo", "read the code", "check the codebase",
-        "fix this", "implement this", "debug this", "review this code", "update the file",
-        "change the file", "add a", "remove the", "search the repo", "test suite",
+        "run tests",
+        "write code",
+        "open the repo",
+        "read the code",
+        "check the codebase",
+        "fix this",
+        "implement this",
+        "debug this",
+        "review this code",
+        "update the file",
+        "change the file",
+        "add a",
+        "remove the",
+        "search the repo",
+        "test suite",
+    ];
+    let analyst_phrases = [
+        "analyze this dataset",
+        "analyze this csv",
+        "look at the data",
+        "summarize the dataset",
+        "compute statistics",
+        "run polars",
+        "group the data",
+        "column correlation",
     ];
 
     let stripped = last_user
         .trim_matches(|c: char| !c.is_alphanumeric() && !c.is_whitespace())
         .to_string();
 
-    if stripped.split_whitespace().count() <= 3 && !last_user.contains('\n') && last_user.len() < 40 {
-        return RouteDecision::Direct;
-    }
-
-    if direct_markers
-        .iter()
-        .any(|marker| stripped == *marker || stripped.starts_with(&format!("{marker} ")) || stripped.ends_with(&format!(" {marker}")))
+    if stripped.split_whitespace().count() <= 3 && !last_user.contains('\n') && last_user.len() < 40
     {
         return RouteDecision::Direct;
     }
 
+    if direct_markers.iter().any(|marker| {
+        stripped == *marker
+            || stripped.starts_with(&format!("{marker} "))
+            || stripped.ends_with(&format!(" {marker}"))
+    }) {
+        return RouteDecision::Direct;
+    }
+
+    let analyst_score = marker_score(&last_user, &analyst_markers)
+        + marker_score(&last_user, &analyst_phrases) * 2;
     let coder_score = marker_score(&last_user, &coder_markers)
         + marker_score(&last_user, &coder_phrases) * 2
         + if last_user.contains('\n') { 2 } else { 0 }
@@ -778,6 +951,9 @@ fn route_request(request: &ProviderRequest) -> RouteDecision {
     }
     if planner_score >= 2 && coder_score <= 2 {
         return RouteDecision::Planner;
+    }
+    if analyst_score > coder_score && analyst_score > 0 {
+        return RouteDecision::Analyst;
     }
     if coder_score > 0 {
         return RouteDecision::Coder;
@@ -801,7 +977,12 @@ fn summarize_job_title(request: &ProviderRequest) -> String {
         .find(|message| matches!(message.role, Role::User))
         .map(|message| message.content.trim())
         .unwrap_or("coding task");
-    let first_line = last_user.lines().next().unwrap_or("coding task").trim().to_lowercase();
+    let first_line = last_user
+        .lines()
+        .next()
+        .unwrap_or("coding task")
+        .trim()
+        .to_lowercase();
     let stopwords = [
         "the", "a", "an", "to", "for", "of", "and", "or", "that", "this", "can", "you", "please",
         "some", "just", "make", "with", "from", "into", "but",
@@ -826,8 +1007,8 @@ fn summarize_job_title(request: &ProviderRequest) -> String {
 fn dedupe_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<ToolCall> {
     let mut calls_map: HashMap<String, ToolCall> = HashMap::new();
     for tc in tool_calls {
-        let is_empty =
-            tc.args.is_null() || (tc.args.is_object() && tc.args.as_object().is_some_and(|m| m.is_empty()));
+        let is_empty = tc.args.is_null()
+            || (tc.args.is_object() && tc.args.as_object().is_some_and(|m| m.is_empty()));
         if !is_empty || !calls_map.contains_key(&tc.id) {
             calls_map.insert(tc.id.clone(), tc);
         }

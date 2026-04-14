@@ -29,7 +29,9 @@ pub fn spawn_worker(provider: Arc<dyn Provider>) -> WorkerHandles {
                         provider.generate(&request, session_id, turn_id, &event_tx);
                     });
                 }
-                WorkerCmd::UpdateProvider { provider: new_provider } => {
+                WorkerCmd::UpdateProvider {
+                    provider: new_provider,
+                } => {
                     provider = Arc::from(new_provider);
                 }
                 WorkerCmd::Shutdown => break,

@@ -44,6 +44,7 @@ pub enum AgentKind {
     Orchestrator,
     Planner,
     Coder,
+    Analyst,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,7 +79,9 @@ pub enum TurnStepStatus {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExecutionArtifact {
-    AssistantNote { text: String },
+    AssistantNote {
+        text: String,
+    },
     ToolCall {
         tool_name: String,
         args: serde_json::Value,
@@ -115,13 +118,7 @@ impl ContinuationFrame {
     pub fn as_system_text(&self) -> String {
         let mut content = format!(
             "Internal continuation frame.\nphase={}\nsummary={}",
-            match self.phase {
-                AgentPhase::Plan => "plan",
-                AgentPhase::Explore => "explore",
-                AgentPhase::Act => "act",
-                AgentPhase::Verify => "verify",
-                AgentPhase::Respond => "respond",
-            },
+            self.phase.as_str(),
             self.summary.trim()
         );
 
@@ -157,9 +154,10 @@ impl ExecutionArtifact {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
+    #[default]
     Todo,
     InProgress,
     Done,
@@ -176,7 +174,57 @@ pub enum AgentPhase {
     Respond,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+impl AgentPhase {
+    pub const ALL: [Self; 5] = [
+        Self::Plan,
+        Self::Explore,
+        Self::Act,
+        Self::Verify,
+        Self::Respond,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Explore => "explore",
+            Self::Act => "act",
+            Self::Verify => "verify",
+            Self::Respond => "respond",
+        }
+    }
+
+    pub fn status(self) -> &'static str {
+        match self {
+            Self::Plan => "planning...",
+            Self::Explore => "exploring...",
+            Self::Act => "executing...",
+            Self::Verify => "verifying...",
+            Self::Respond => "responding...",
+        }
+    }
+
+    pub fn rules(self) -> &'static str {
+        match self {
+            Self::Plan => {
+                "Use only board_update. Set or refine the goal, summary, tasks, and current task before any work."
+            }
+            Self::Explore => {
+                "Gather evidence with read-only tools. Update the board with facts, blockers, and task state. Do not modify files."
+            }
+            Self::Act => {
+                "Execute the selected task. Prefer narrow edits. Record attempts and task status changes in the board."
+            }
+            Self::Verify => {
+                "Validate the work with focused reads or commands. Add evidence to the board and mark tasks done or blocked."
+            }
+            Self::Respond => {
+                "Do not call tools. Give a concise user-facing summary of what changed, what was verified, and what remains."
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
     pub title: String,
@@ -192,21 +240,6 @@ pub struct Task {
     pub attempt_count: u32,
     #[serde(default)]
     pub last_error: Option<String>,
-}
-
-impl Default for Task {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            title: String::new(),
-            status: TaskStatus::Todo,
-            deps: Vec::new(),
-            acceptance_criteria: Vec::new(),
-            evidence: Vec::new(),
-            attempt_count: 0,
-            last_error: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -239,9 +272,15 @@ pub struct Board {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum BoardOperation {
-    SetGoal { goal: String },
-    SetSummary { summary: String },
-    SetCurrentTask { task_id: Option<String> },
+    SetGoal {
+        goal: String,
+    },
+    SetSummary {
+        summary: String,
+    },
+    SetCurrentTask {
+        task_id: Option<String>,
+    },
     AddTask {
         id: String,
         title: String,
@@ -263,8 +302,12 @@ pub enum BoardOperation {
         task_id: String,
         evidence: String,
     },
-    AddFact { fact: String },
-    AddBlocker { blocker: String },
+    AddFact {
+        fact: String,
+    },
+    AddBlocker {
+        blocker: String,
+    },
     ClearBlockers,
     SetBudget {
         #[serde(default)]
@@ -274,13 +317,9 @@ pub enum BoardOperation {
         #[serde(default)]
         max_output_bytes: Option<usize>,
     },
-    SetLastPhase { phase: AgentPhase },
-}
-
-impl Default for TaskStatus {
-    fn default() -> Self {
-        Self::Todo
-    }
+    SetLastPhase {
+        phase: AgentPhase,
+    },
 }
 
 impl Board {
@@ -330,7 +369,10 @@ impl Board {
                         task.status = *status;
                     }
                 }
-                BoardOperation::RecordAttempt { task_id, last_error } => {
+                BoardOperation::RecordAttempt {
+                    task_id,
+                    last_error,
+                } => {
                     if let Some(task) = self.tasks.iter_mut().find(|task| task.id == *task_id) {
                         task.attempt_count = task.attempt_count.saturating_add(1);
                         task.last_error = last_error.clone();

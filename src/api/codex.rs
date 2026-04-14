@@ -21,9 +21,7 @@ pub struct ToolCall {
 
 impl CodexClient {
     pub fn new() -> Result<Self> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(None)
-            .build()?;
+        let client = reqwest::blocking::Client::builder().timeout(None).build()?;
         Ok(Self { client })
     }
 
@@ -45,7 +43,7 @@ impl CodexClient {
             .bearer_auth(&auth.access_token)
             .header("Accept", "text/event-stream")
             .header("OpenAI-Beta", "responses=experimental");
-        
+
         if let Some(ref acct) = auth.account_id {
             req = req.header("ChatGPT-Account-ID", acct);
         }
@@ -65,10 +63,20 @@ impl CodexClient {
             let line = line?;
             if line.is_empty() {
                 if !data.is_empty() {
-                    let done = dispatch_sse_event(&data, session_id.clone(), turn_id.clone(), emit_text_events, tx, &mut tool_calls, &mut text_acc)
-                        .map_err(|e| anyhow!(e))?;
+                    let done = dispatch_sse_event(
+                        &data,
+                        session_id.clone(),
+                        turn_id.clone(),
+                        emit_text_events,
+                        tx,
+                        &mut tool_calls,
+                        &mut text_acc,
+                    )
+                    .map_err(|e| anyhow!(e))?;
                     data.clear();
-                    if done { break; }
+                    if done {
+                        break;
+                    }
                 }
                 continue;
             }
@@ -76,10 +84,20 @@ impl CodexClient {
                 let rest = rest.strip_prefix(' ').unwrap_or(rest);
                 if !data.is_empty() {
                     if rest.trim().starts_with('{') {
-                         let done = dispatch_sse_event(&data, session_id.clone(), turn_id.clone(), emit_text_events, tx, &mut tool_calls, &mut text_acc)
-                            .map_err(|e| anyhow!(e))?;
-                         data.clear();
-                         if done { break; }
+                        let done = dispatch_sse_event(
+                            &data,
+                            session_id.clone(),
+                            turn_id.clone(),
+                            emit_text_events,
+                            tx,
+                            &mut tool_calls,
+                            &mut text_acc,
+                        )
+                        .map_err(|e| anyhow!(e))?;
+                        data.clear();
+                        if done {
+                            break;
+                        }
                     } else {
                         data.push('\n');
                     }
@@ -87,10 +105,19 @@ impl CodexClient {
                 data.push_str(rest);
             }
         }
-        
+
         // Final flush
         if !data.is_empty() {
-            dispatch_sse_event(&data, session_id, turn_id, emit_text_events, tx, &mut tool_calls, &mut text_acc).ok();
+            dispatch_sse_event(
+                &data,
+                session_id,
+                turn_id,
+                emit_text_events,
+                tx,
+                &mut tool_calls,
+                &mut text_acc,
+            )
+            .ok();
         }
 
         Ok((text_acc, tool_calls))
@@ -100,14 +127,32 @@ impl CodexClient {
 fn find_tool_calls(v: &Value, calls: &mut Vec<ToolCall>) {
     if let Some(obj) = v.as_object() {
         if obj.get("type").and_then(|t| t.as_str()) == Some("function_call") {
-             let v_obj = Value::Object(obj.clone());
-             let id = obj.get("call_id").or_else(|| obj.get("id")).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-             let name = obj.get("name").or_else(|| v_obj.pointer("/function/name")).and_then(|v| v.as_str()).unwrap_or_default().to_string();
-             let args_val = obj.get("arguments").or_else(|| v_obj.pointer("/function/arguments")).cloned().unwrap_or_default();
-             let args: Value = if let Some(s) = args_val.as_str() { serde_json::from_str(s).unwrap_or_default() } else { args_val };
-             if !name.is_empty() {
-                 calls.push(ToolCall { id, name, args });
-             }
+            let v_obj = Value::Object(obj.clone());
+            let id = obj
+                .get("call_id")
+                .or_else(|| obj.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let name = obj
+                .get("name")
+                .or_else(|| v_obj.pointer("/function/name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let args_val = obj
+                .get("arguments")
+                .or_else(|| v_obj.pointer("/function/arguments"))
+                .cloned()
+                .unwrap_or_default();
+            let args: Value = if let Some(s) = args_val.as_str() {
+                serde_json::from_str(s).unwrap_or_default()
+            } else {
+                args_val
+            };
+            if !name.is_empty() {
+                calls.push(ToolCall { id, name, args });
+            }
         }
         for value in obj.values() {
             find_tool_calls(value, calls);
@@ -131,11 +176,10 @@ fn dispatch_sse_event(
     if data.trim() == "[DONE]" {
         return Ok(true);
     }
-    let value: Value =
-        serde_json::from_str(data).map_err(|e| format!("parse sse event: {e}"))?;
-    
+    let value: Value = serde_json::from_str(data).map_err(|e| format!("parse sse event: {e}"))?;
+
     let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    
+
     // Universal tool call search in the whole object
     find_tool_calls(&value, tool_calls);
 
@@ -153,25 +197,25 @@ fn dispatch_sse_event(
             }
         }
         "output" => {
-             // In 'output' event, look for content[].text
-             if let Some(content_arr) = value.pointer("/content").and_then(|v| v.as_array()) {
-                 for item in content_arr {
-                     if item.get("type").and_then(|v| v.as_str()) == Some("text") {
-                         if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                              if text_acc.is_empty() {
-                                  text_acc.push_str(text);
-                                  if emit_text_events {
-                                      let _ = tx.send(WorkerEvent::Delta {
-                                          session_id: session_id.clone(),
-                                          turn_id: turn_id.clone(),
-                                          delta: text.to_string(),
-                                      });
-                                  }
-                              }
-                         }
-                     }
-                 }
-             }
+            // In 'output' event, look for content[].text
+            if let Some(content_arr) = value.pointer("/content").and_then(|v| v.as_array()) {
+                for item in content_arr {
+                    if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                            if text_acc.is_empty() {
+                                text_acc.push_str(text);
+                                if emit_text_events {
+                                    let _ = tx.send(WorkerEvent::Delta {
+                                        session_id: session_id.clone(),
+                                        turn_id: turn_id.clone(),
+                                        delta: text.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         "response.failed" | "error" => {
             let err = value

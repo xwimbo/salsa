@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod sandbox;
 
 use std::fs;
@@ -7,27 +8,21 @@ use anyhow::{anyhow, bail, Context, Result};
 pub use sandbox::Sandbox;
 use serde_json::{json, Value};
 
-use crate::models::{AgentPhase, BoardOperation};
+use crate::models::{AgentKind, AgentPhase, BoardOperation};
 
-pub fn tool_specs_for_phase(phase: AgentPhase) -> Vec<Value> {
-    match phase {
-        AgentPhase::Plan => vec![board_update_spec()],
-        AgentPhase::Explore => vec![fs_read_spec(), fs_list_spec(), board_update_spec()],
-        AgentPhase::Act => vec![
-            fs_read_spec(),
-            fs_list_spec(),
-            fs_write_spec(),
-            fs_edit_spec(),
-            fs_delete_spec(),
-            sh_run_spec(),
-            board_update_spec(),
-        ],
-        AgentPhase::Verify => vec![fs_read_spec(), fs_list_spec(), sh_run_spec(), board_update_spec()],
-        AgentPhase::Respond => Vec::new(),
+pub fn tool_specs_for_agent_phase(agent: AgentKind, phase: AgentPhase) -> Vec<Value> {
+    match agent {
+        AgentKind::Analyst => analyst_tool_specs_for_phase(phase),
+        AgentKind::Orchestrator | AgentKind::Planner | AgentKind::Coder => {
+            default_tool_specs_for_phase(phase)
+        }
     }
 }
 
 pub fn tool_slug(name: &str, args: &Value) -> String {
+    if let Some(slug) = analysis::tool_slug(name, args) {
+        return slug;
+    }
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
     let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("?");
     match name {
@@ -56,12 +51,49 @@ pub fn execute_tool(
         "fs_delete" => execute_fs_delete(sandbox, args),
         "sh_run" => execute_sh_run(sandbox, args),
         "board_update" => execute_board_update(args),
+        "df_inspect" | "df_describe" | "df_filter" | "df_group_stats" | "df_value_counts"
+        | "df_correlation" => analysis::execute(sandbox, name, args).map(|output| (output, Vec::new())),
         _ => Err(anyhow!("unknown tool: {}", name)),
     };
 
     match result {
         Ok((output, ops)) => (truncate_output(output, max_output_bytes), ops),
         Err(err) => (format!("[error] {}", err), Vec::new()),
+    }
+}
+
+fn default_tool_specs_for_phase(phase: AgentPhase) -> Vec<Value> {
+    match phase {
+        AgentPhase::Plan => vec![board_update_spec()],
+        AgentPhase::Explore => vec![fs_read_spec(), fs_list_spec(), board_update_spec()],
+        AgentPhase::Act => vec![
+            fs_read_spec(),
+            fs_list_spec(),
+            fs_write_spec(),
+            fs_edit_spec(),
+            fs_delete_spec(),
+            sh_run_spec(),
+            board_update_spec(),
+        ],
+        AgentPhase::Verify => vec![
+            fs_read_spec(),
+            fs_list_spec(),
+            sh_run_spec(),
+            board_update_spec(),
+        ],
+        AgentPhase::Respond => Vec::new(),
+    }
+}
+
+fn analyst_tool_specs_for_phase(phase: AgentPhase) -> Vec<Value> {
+    match phase {
+        AgentPhase::Plan => vec![board_update_spec()],
+        AgentPhase::Explore | AgentPhase::Act | AgentPhase::Verify => {
+            let mut specs = vec![fs_read_spec(), fs_list_spec(), board_update_spec()];
+            specs.extend(analysis::tool_specs());
+            specs
+        }
+        AgentPhase::Respond => Vec::new(),
     }
 }
 
@@ -104,7 +136,10 @@ fn execute_fs_write(sandbox: &Sandbox, args: &Value) -> Result<(String, Vec<Boar
         fs::create_dir_all(parent).with_context(|| format!("creating parents for {}", path))?;
     }
     fs::write(&abs, content).with_context(|| format!("writing {}", path))?;
-    Ok((format!("wrote {} bytes to {}", content.len(), path), Vec::new()))
+    Ok((
+        format!("wrote {} bytes to {}", content.len(), path),
+        Vec::new(),
+    ))
 }
 
 fn execute_fs_edit(sandbox: &Sandbox, args: &Value) -> Result<(String, Vec<BoardOperation>)> {
@@ -159,9 +194,12 @@ fn execute_board_update(args: &Value) -> Result<(String, Vec<BoardOperation>)> {
         .get("operations")
         .cloned()
         .ok_or_else(|| anyhow!("missing operations"))?;
-    let operations: Vec<BoardOperation> = serde_json::from_value(ops_value)
-        .context("parsing board_update operations")?;
-    Ok((format!("applied {} board operations", operations.len()), operations))
+    let operations: Vec<BoardOperation> =
+        serde_json::from_value(ops_value).context("parsing board_update operations")?;
+    Ok((
+        format!("applied {} board operations", operations.len()),
+        operations,
+    ))
 }
 
 fn truncate_output(mut output: String, max_output_bytes: usize) -> String {

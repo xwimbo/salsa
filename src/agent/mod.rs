@@ -73,12 +73,35 @@ pub enum WorkerCmd {
 
 #[derive(Debug)]
 pub enum WorkerEvent {
-    Delta { session_id: String, turn_id: String, delta: String },
-    Done { session_id: String, turn_id: String },
-    SystemNote { session_id: String, turn_id: String, note: String },
-    ToolStatus { session_id: String, turn_id: String, status: String },
-    ToolCalls { session_id: String, turn_id: String, calls: serde_json::Value },
-    PhaseChange { session_id: String, turn_id: String, phase: AgentPhase },
+    Delta {
+        session_id: String,
+        turn_id: String,
+        delta: String,
+    },
+    Done {
+        session_id: String,
+        turn_id: String,
+    },
+    SystemNote {
+        session_id: String,
+        turn_id: String,
+        note: String,
+    },
+    ToolStatus {
+        session_id: String,
+        turn_id: String,
+        status: String,
+    },
+    ToolCalls {
+        session_id: String,
+        turn_id: String,
+        calls: serde_json::Value,
+    },
+    PhaseChange {
+        session_id: String,
+        turn_id: String,
+        phase: AgentPhase,
+    },
     StepUpdate {
         session_id: String,
         turn_id: String,
@@ -113,5 +136,9 @@ pub enum WorkerEvent {
         job_id: String,
         content: String,
     },
-    Error { session_id: String, turn_id: String, err: String },
+    Error {
+        session_id: String,
+        turn_id: String,
+        err: String,
+    },
 }
