@@ -46,6 +46,10 @@ pub struct Paths {
     pub projects: PathBuf,
     pub sessions: PathBuf,
     pub agents: PathBuf,
+    pub todos: PathBuf,
+    pub web_cache: PathBuf,
+    pub teams: PathBuf,
+    pub commands: PathBuf,
 }
 
 impl Paths {
@@ -58,6 +62,10 @@ impl Paths {
             projects: root.join("projects"),
             sessions: root.join("sessions"),
             agents: root.join("agents"),
+            todos: root.join("todos"),
+            web_cache: root.join("web_cache"),
+            teams: root.join("teams"),
+            commands: root.join("commands"),
             root,
         })
     }
@@ -72,6 +80,10 @@ pub fn bootstrap() -> Result<(Config, Paths)> {
         &paths.projects,
         &paths.sessions,
         &paths.agents,
+        &paths.todos,
+        &paths.web_cache,
+        &paths.teams,
+        &paths.commands,
     ] {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }

@@ -379,6 +379,7 @@ fn run_specialist_turn(
         label,
         Some((&session_id, &turn_id, tx)),
         None,
+        false,
     )?;
     let _ = summary;
     let _ = tx.send(WorkerEvent::Done {
@@ -411,10 +412,11 @@ fn run_background_specialist_job(
         },
         None,
         Some((&session_id, &job_id, tx)),
+        false,
     )
 }
 
-fn run_specialist_loop(
+pub(crate) fn run_specialist_loop(
     auth: &CodexAuth,
     client: &CodexClient,
     sandbox: &Sandbox,
@@ -423,6 +425,7 @@ fn run_specialist_loop(
     label: &str,
     interactive_turn: Option<(&str, &str, &Sender<WorkerEvent>)>,
     background_job: Option<(&str, &str, &Sender<WorkerEvent>)>,
+    is_subagent: bool,
 ) -> Result<String> {
     let mut conversation = request.messages.clone();
     let mut board = request
@@ -485,7 +488,7 @@ fn run_specialist_loop(
                 .collect();
 
             let instructions = build_specialist_instructions(request, &board, phase, agent, label);
-            let allowed_tools = tools::tool_specs_for_agent_phase(agent, phase);
+            let allowed_tools = tools::tool_specs_for_agent_phase(agent, phase, is_subagent);
             let tool_choice = if allowed_tools.is_empty() {
                 "none"
             } else {
@@ -519,7 +522,7 @@ fn run_specialist_loop(
                 .or_else(|| background_job.map(|(_, _, tx)| tx))
                 .expect("coder loop requires a sender");
             let (text_content, tool_calls) =
-                client.request(auth, &body, session_key, turn_key, emit_text, tx)?;
+                client.request(auth, &body, session_key.clone(), turn_key.clone(), emit_text, tx)?;
 
             let unique_calls = dedupe_tool_calls(tool_calls);
             let used_tools_this_iteration = !unique_calls.is_empty();
@@ -573,8 +576,19 @@ fn run_specialist_loop(
                         });
                     }
 
-                    let execution = tools::execute_tool(
+                    let tool_ctx = tools::SalsaToolContext {
                         sandbox,
+                        auth,
+                        client,
+                        session_id: &session_key,
+                        turn_id: &turn_key,
+                        tx,
+                        model: &request.model,
+                        custom_prompt: request.custom_prompt.as_deref(),
+                        is_subagent,
+                    };
+                    let execution = tools::execute_tool(
+                        &tool_ctx,
                         &call.name,
                         &call.args,
                         board.budgets.max_output_bytes,

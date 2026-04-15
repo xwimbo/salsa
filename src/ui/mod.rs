@@ -10,7 +10,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 // use tui_tabs::TabNav;
 
-use crate::app::{App, MenuAction};
+use crate::app::{App, FileBrowserButton, MenuAction};
 use crate::config;
 use crate::models::{AgentKind, ExecutionArtifact, JobStatus, Role, TurnStepStatus};
 
@@ -360,6 +360,236 @@ impl App {
                 Paragraph::new(prompt_text).wrap(Wrap { trim: false }),
                 inner,
             );
+        }
+
+        if self.showing_help {
+            let w = 58.min(area.width.saturating_sub(4));
+            let h = 30.min(area.height.saturating_sub(4));
+            let overlay = Rect {
+                x: area.x + (area.width.saturating_sub(w)) / 2,
+                y: area.y + (area.height.saturating_sub(h)) / 2,
+                width: w,
+                height: h,
+            };
+            frame.render_widget(Clear, overlay);
+            let block = Block::default()
+                .title(" Help ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::ORANGE));
+            let inner = block.inner(overlay);
+            frame.render_widget(block, overlay);
+
+            let help_lines = vec![
+                Line::from(Span::styled(
+                    "Keyboard Shortcuts",
+                    Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                help_line("Ctrl+N", "New session/conversation"),
+                help_line("Tab", "Next tab"),
+                help_line("Shift+Tab", "Previous tab"),
+                help_line("Ctrl+R", "Rename current session"),
+                help_line("Enter", "Send message"),
+                help_line("PageUp/Down", "Scroll chat history"),
+                help_line("Esc", "Close overlay / cancel"),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Slash Commands",
+                    Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                help_line("/new session", "Create a new session"),
+                help_line("/new project", "Create a new project"),
+                help_line("/del session", "Delete current session"),
+                help_line("/del project", "Delete current project"),
+                help_line("/add", "Add files to workspace"),
+                help_line("/help", "Show this help screen"),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Menu Bar",
+                    Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                help_line("Settings", "Toggle jobs pane, edit profile"),
+                help_line("Prompt", "View/edit system prompt"),
+                help_line("Projects", "Switch projects or create new"),
+                help_line("Help", "This screen"),
+                help_line("Quit", "Exit salsa"),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Agent Tools",
+                    Style::default().fg(theme::ORANGE).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                help_line("Filesystem", "Read, write, edit, delete files"),
+                help_line("Shell", "Run commands in workspace"),
+                help_line("Web Fetch", "Fetch and cache web pages"),
+                help_line("Sub-agents", "Spawn background workers"),
+                help_line("Teams", "Coordinate multiple agents"),
+                help_line("Skills", "Load custom .md commands"),
+                help_line("Cron", "Schedule recurring tasks"),
+                help_line("Tasks/Todos", "Track work progress"),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Config: ~/.salsa/config.yaml",
+                    Style::default().fg(theme::MUTED),
+                )),
+                Line::from(Span::styled(
+                    "Skills: ~/.salsa/commands/*.md",
+                    Style::default().fg(theme::MUTED),
+                )),
+                Line::from(Span::styled(
+                    "Press Esc to close",
+                    Style::default().fg(theme::MUTED),
+                )),
+            ];
+
+            frame.render_widget(
+                Paragraph::new(help_lines).wrap(Wrap { trim: false }),
+                Rect {
+                    x: inner.x + 1,
+                    y: inner.y,
+                    width: inner.width.saturating_sub(2),
+                    height: inner.height,
+                },
+            );
+        }
+
+        if let Some(fb) = &mut self.file_browser {
+            let w = area.width.saturating_sub(8).min(80).max(48);
+            let h = area.height.saturating_sub(6).min(24).max(12);
+            let overlay = Rect {
+                x: area.x + (area.width.saturating_sub(w)) / 2,
+                y: area.y + (area.height.saturating_sub(h)) / 2,
+                width: w,
+                height: h,
+            };
+            frame.render_widget(Clear, overlay);
+            let block = Block::default()
+                .title(" Add Files ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::ORANGE));
+            let inner = block.inner(overlay);
+            frame.render_widget(block, overlay);
+
+            self.file_browser_hits.clear();
+            self.file_browser_button_hits.clear();
+
+            let path_line = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(format!("Directory: {}", config::tilde_path(&fb.current_dir)))
+                    .style(Style::default().fg(theme::MUTED)),
+                path_line,
+            );
+
+            let list_height = inner.height.saturating_sub(4);
+            let list_area = Rect {
+                x: inner.x,
+                y: inner.y + 1,
+                width: inner.width,
+                height: list_height,
+            };
+
+            if fb.cursor < fb.scroll_offset {
+                fb.scroll_offset = fb.cursor;
+            }
+            let visible_rows = list_area.height as usize;
+            if visible_rows > 0 && fb.cursor >= fb.scroll_offset + visible_rows {
+                fb.scroll_offset = fb.cursor + 1 - visible_rows;
+            }
+
+            if fb.entries.is_empty() {
+                frame.render_widget(
+                    Paragraph::new("This folder is empty.")
+                        .style(Style::default().fg(theme::MUTED)),
+                    list_area,
+                );
+            } else {
+                for row in 0..list_area.height {
+                    let idx = fb.scroll_offset + row as usize;
+                    if idx >= fb.entries.len() {
+                        break;
+                    }
+                    let entry = &fb.entries[idx];
+                    let rect = Rect {
+                        x: list_area.x,
+                        y: list_area.y + row,
+                        width: list_area.width,
+                        height: 1,
+                    };
+                    let selected = fb.is_selected(idx);
+                    let cursor = idx == fb.cursor;
+                    let hovered = self.hovered_file_browser == Some(idx);
+                    let style = if cursor {
+                        Style::default().bg(theme::BG_ALT).fg(theme::ORANGE)
+                    } else if hovered {
+                        Style::default().bg(theme::BG_ALT).fg(theme::FG)
+                    } else {
+                        Style::default().fg(theme::FG)
+                    };
+                    let marker = if entry.is_dir {
+                        "›"
+                    } else if selected {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    };
+                    let label = if entry.is_dir {
+                        format!("{marker} {}/", entry.name)
+                    } else {
+                        format!("{marker} {}", entry.name)
+                    };
+                    frame.render_widget(Paragraph::new(label).style(style), rect);
+                    self.file_browser_hits.push((rect, idx));
+                }
+            }
+
+            let footer_y = inner.y + inner.height.saturating_sub(2);
+            let hint_rect = Rect {
+                x: inner.x,
+                y: footer_y,
+                width: inner.width.saturating_sub(24),
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new("Enter=open/copy  Space=select  Backspace=up  Esc=cancel")
+                    .style(Style::default().fg(theme::MUTED)),
+                hint_rect,
+            );
+
+            let buttons = [
+                (" Back ", FileBrowserButton::Back),
+                (" Add Selected ", FileBrowserButton::Confirm),
+                (" Cancel ", FileBrowserButton::Cancel),
+            ];
+            let total_button_width: u16 =
+                buttons.iter().map(|(label, _)| label.chars().count() as u16).sum::<u16>() + 2;
+            let mut x = inner.x + inner.width.saturating_sub(total_button_width);
+            for (label, action) in buttons {
+                let width = label.chars().count() as u16;
+                let rect = Rect {
+                    x,
+                    y: footer_y,
+                    width,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(label).style(Style::default().fg(theme::ORANGE)),
+                    rect,
+                );
+                self.file_browser_button_hits.push((rect, action));
+                x += width + 1;
+            }
+        } else {
+            self.file_browser_hits.clear();
+            self.file_browser_button_hits.clear();
         }
     }
 
@@ -885,6 +1115,24 @@ impl App {
             frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), padded);
             return;
         }
+        if let Some(ref confirm) = self.pending_confirm {
+            let prompt = match confirm {
+                crate::app::ConfirmAction::DeleteSession { title, .. } => {
+                    format!("Delete session \"{}\"? (y/n)", title)
+                }
+                crate::app::ConfirmAction::DeleteProject { name } => {
+                    format!("Delete project \"{}\"? (y/n)", name)
+                }
+            };
+            let line = Line::from(vec![
+                Span::styled(prompt, Style::default().fg(theme::RED).add_modifier(Modifier::BOLD)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(line).wrap(Wrap { trim: false }),
+                padded,
+            );
+            return;
+        }
         let content = self
             .sessions
             .get(self.active_tab)
@@ -906,6 +1154,16 @@ impl App {
             padded,
         );
     }
+}
+
+fn help_line<'a>(key: &'a str, desc: &'a str) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {:14}", key),
+            Style::default().fg(theme::FG).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(desc.to_string(), Style::default().fg(theme::MUTED)),
+    ])
 }
 
 fn latest_artifact_label(artifact: Option<&ExecutionArtifact>) -> &'static str {

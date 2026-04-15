@@ -21,7 +21,9 @@ mod tools;
 mod ui;
 
 use agent::provider::{CodexProvider, EchoProvider, Provider};
+use api::codex::CodexClient;
 use app::App;
+use tools::Sandbox;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -102,6 +104,18 @@ fn main() -> Result<()> {
         Err(_) => (Box::new(EchoProvider), auth::CodexAuth::default()),
     };
     let worker = agent::worker::spawn_worker(Arc::from(provider));
+
+    // Start background cron scheduler
+    if let (Ok(client), Ok(sandbox)) = (CodexClient::new(), Sandbox::new(paths.workspace.clone())) {
+        let _cron_handle = agent::cron_scheduler::start_cron_scheduler(
+            auth.clone(),
+            client,
+            sandbox,
+            cfg.default_model.clone(),
+            worker.event_tx.clone(),
+        );
+    }
+
     let mut terminal = setup_terminal()?;
     let mut app = App::new(cfg, paths, worker, auth);
     let result = run(&mut terminal, &mut app);

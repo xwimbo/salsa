@@ -1,21 +1,47 @@
+pub mod agent;
 pub mod analysis;
+pub mod brief;
+pub mod cron;
 pub mod media;
+pub mod plan_mode;
 pub mod sandbox;
+pub mod skills;
+pub mod tasks;
+pub mod team;
+pub mod todo;
+pub mod web;
 
 use std::fs;
 use std::process::Command;
+use std::sync::mpsc::Sender;
 
 use anyhow::{anyhow, bail, Context, Result};
 pub use sandbox::Sandbox;
 use serde_json::{json, Value};
 
+use crate::agent::WorkerEvent;
+use crate::api::codex::CodexClient;
+use crate::auth::CodexAuth;
 use crate::models::{AgentKind, AgentPhase, BoardOperation};
 
-pub fn tool_specs_for_agent_phase(agent: AgentKind, phase: AgentPhase) -> Vec<Value> {
+/// Bundles all context needed by tools that require auth, networking, or sub-agent spawning.
+pub struct SalsaToolContext<'a> {
+    pub sandbox: &'a Sandbox,
+    pub auth: &'a CodexAuth,
+    pub client: &'a CodexClient,
+    pub session_id: &'a str,
+    pub turn_id: &'a str,
+    pub tx: &'a Sender<WorkerEvent>,
+    pub model: &'a str,
+    pub custom_prompt: Option<&'a str>,
+    pub is_subagent: bool,
+}
+
+pub fn tool_specs_for_agent_phase(agent: AgentKind, phase: AgentPhase, is_subagent: bool) -> Vec<Value> {
     match agent {
         AgentKind::Analyst => analyst_tool_specs_for_phase(phase),
         AgentKind::Orchestrator | AgentKind::Planner | AgentKind::Coder => {
-            default_tool_specs_for_phase(phase)
+            default_tool_specs_for_phase(phase, is_subagent)
         }
     }
 }
@@ -37,31 +63,120 @@ pub fn tool_slug(name: &str, args: &Value) -> String {
         "fs_delete" => format!("Using deleteTool to delete file {}", path),
         "sh_run" => format!("Using shellTool to run command: {}", command),
         "board_update" => "Updating project board...".to_string(),
+        "brief" => "Sending brief...".to_string(),
+        "enter_plan_mode" => "Entering plan mode...".to_string(),
+        "exit_plan_mode" => "Exiting plan mode...".to_string(),
+        "web_fetch" => {
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("Fetching {}...", url)
+        }
+        "todo_write" => "Updating todos...".to_string(),
+        "task_create" => "Creating task...".to_string(),
+        "task_get" | "task_list" => "Reading tasks...".to_string(),
+        "task_update" | "task_stop" | "task_output" => "Updating task...".to_string(),
+        "cron_create" => "Scheduling task...".to_string(),
+        "cron_delete" => "Removing scheduled task...".to_string(),
+        "cron_list" => "Listing scheduled tasks...".to_string(),
+        "skill" => {
+            let skill_name = args.get("skill").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("Running skill: {}", skill_name)
+        }
+        "agent" => {
+            let desc = args.get("description").and_then(|v| v.as_str()).unwrap_or("sub-agent");
+            format!("Spawning agent: {}", desc)
+        }
+        "team_create" => {
+            let team = args.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("Creating team: {}", team)
+        }
+        "team_delete" => "Deleting team...".to_string(),
         other => format!("Using {} on {}", other, path),
     }
 }
 
 pub fn execute_tool(
-    sandbox: &Sandbox,
+    ctx: &SalsaToolContext,
     name: &str,
     args: &Value,
     max_output_bytes: usize,
 ) -> media::ToolExecution {
     let result = match name {
-        "fs_read" => execute_fs_read(sandbox, args).map(tool_output_only),
-        "fs_list" => execute_fs_list(sandbox, args).map(tool_output_only),
-        "fs_write" => execute_fs_write(sandbox, args).map(tool_output_only),
-        "fs_edit" => execute_fs_edit(sandbox, args).map(tool_output_only),
-        "fs_delete" => execute_fs_delete(sandbox, args).map(tool_output_only),
-        "sh_run" => execute_sh_run(sandbox, args).map(tool_output_only),
+        // Filesystem tools
+        "fs_read" => execute_fs_read(ctx.sandbox, args).map(tool_output_only),
+        "fs_list" => execute_fs_list(ctx.sandbox, args).map(tool_output_only),
+        "fs_write" => execute_fs_write(ctx.sandbox, args).map(tool_output_only),
+        "fs_edit" => execute_fs_edit(ctx.sandbox, args).map(tool_output_only),
+        "fs_delete" => execute_fs_delete(ctx.sandbox, args).map(tool_output_only),
+        "sh_run" => execute_sh_run(ctx.sandbox, args).map(tool_output_only),
         "board_update" => execute_board_update(args).map(tool_output_only),
+
+        // Analysis tools
         "df_inspect" | "df_describe" | "df_filter" | "df_group_stats" | "df_value_counts"
-        | "df_correlation" => analysis::execute(sandbox, name, args).map(|output| media::ToolExecution {
+        | "df_correlation" => analysis::execute(ctx.sandbox, name, args).map(|output| media::ToolExecution {
             output,
             board_ops: Vec::new(),
             attachments: Vec::new(),
         }),
-        "view_image" | "view_pdf" => media::execute(sandbox, name, args),
+
+        // Media tools
+        "view_image" | "view_pdf" => media::execute(ctx.sandbox, name, args),
+
+        // Brief
+        "brief" => brief::execute(ctx.sandbox, args).map(tool_output_only),
+
+        // Plan mode
+        "enter_plan_mode" => plan_mode::execute_enter(args).map(tool_output_only),
+        "exit_plan_mode" => plan_mode::execute_exit(args).map(tool_output_only),
+
+        // Web fetch
+        "web_fetch" => web::execute(args).map(tool_output_only),
+
+        // Todo
+        "todo_write" => todo::execute(ctx.session_id, args).map(tool_output_only),
+
+        // Tasks
+        "task_create" => tasks::execute_create(args).map(tool_output_only),
+        "task_get" => tasks::execute_get(args).map(tool_output_only),
+        "task_update" => tasks::execute_update(args).map(tool_output_only),
+        "task_list" => tasks::execute_list(args).map(tool_output_only),
+        "task_stop" => tasks::execute_stop(args).map(tool_output_only),
+        "task_output" => tasks::execute_output(args).map(tool_output_only),
+
+        // Cron
+        "cron_create" => cron::execute_create(args).map(tool_output_only),
+        "cron_delete" => cron::execute_delete(args).map(tool_output_only),
+        "cron_list" => cron::execute_list(args).map(tool_output_only),
+
+        // Skills
+        "skill" => skills::execute(ctx.sandbox, args).map(tool_output_only),
+
+        // Agent (sub-agent spawning — blocked for sub-agents to prevent recursion)
+        "agent" => {
+            if ctx.is_subagent {
+                Err(anyhow!("sub-agents cannot spawn further sub-agents"))
+            } else {
+                agent::execute(
+                    ctx.auth, ctx.client, ctx.sandbox, args,
+                    ctx.session_id, ctx.turn_id, ctx.tx,
+                    ctx.model, ctx.custom_prompt,
+                ).map(tool_output_only)
+            }
+        }
+
+        // Team (blocked for sub-agents)
+        "team_create" => {
+            if ctx.is_subagent {
+                Err(anyhow!("sub-agents cannot create teams"))
+            } else {
+                team::execute_create(
+                    ctx.auth, ctx.client, ctx.sandbox, args,
+                    ctx.session_id, ctx.turn_id, ctx.tx,
+                    ctx.model, ctx.custom_prompt,
+                ).map(tool_output_only)
+            }
+        }
+        "team_delete" => team::execute_delete(args).map(tool_output_only),
+
         _ => Err(anyhow!("unknown tool: {}", name)),
     };
 
@@ -78,12 +193,37 @@ pub fn execute_tool(
     }
 }
 
-fn default_tool_specs_for_phase(phase: AgentPhase) -> Vec<Value> {
+fn default_tool_specs_for_phase(phase: AgentPhase, is_subagent: bool) -> Vec<Value> {
+    // Tools available in every non-Respond phase
+    let always = || vec![
+        brief::spec(),
+        plan_mode::enter_spec(),
+        plan_mode::exit_spec(),
+        tasks::create_spec(),
+        tasks::get_spec(),
+        tasks::update_spec(),
+        tasks::list_spec(),
+        tasks::stop_spec(),
+        tasks::output_spec(),
+    ];
+
     match phase {
-        AgentPhase::Plan => vec![board_update_spec()],
+        AgentPhase::Plan => {
+            let mut specs = vec![board_update_spec()];
+            specs.extend(always());
+            specs
+        }
         AgentPhase::Explore => {
             let mut specs = vec![fs_read_spec(), fs_list_spec(), board_update_spec()];
             specs.extend(media::tool_specs());
+            specs.extend(always());
+            specs.push(web::spec());
+            specs.push(skills::spec());
+            if !is_subagent {
+                specs.push(agent::spec());
+                specs.push(team::create_spec());
+                specs.push(team::delete_spec());
+            }
             specs
         }
         AgentPhase::Act => {
@@ -97,11 +237,26 @@ fn default_tool_specs_for_phase(phase: AgentPhase) -> Vec<Value> {
                 board_update_spec(),
             ];
             specs.extend(media::tool_specs());
+            specs.extend(always());
+            specs.push(web::spec());
+            specs.push(todo::spec());
+            specs.push(skills::spec());
+            specs.push(cron::create_spec());
+            specs.push(cron::delete_spec());
+            specs.push(cron::list_spec());
+            if !is_subagent {
+                specs.push(agent::spec());
+                specs.push(team::create_spec());
+                specs.push(team::delete_spec());
+            }
             specs
         }
         AgentPhase::Verify => {
             let mut specs = vec![fs_read_spec(), fs_list_spec(), sh_run_spec(), board_update_spec()];
             specs.extend(media::tool_specs());
+            specs.extend(always());
+            specs.push(web::spec());
+            specs.push(cron::list_spec());
             specs
         }
         AgentPhase::Respond => Vec::new(),

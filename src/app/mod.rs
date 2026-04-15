@@ -28,6 +28,19 @@ pub enum MenuAction {
     Quit,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FileBrowserButton {
+    Back,
+    Confirm,
+    Cancel,
+}
+
+#[derive(Clone, Debug)]
+pub enum ConfirmAction {
+    DeleteSession { idx: usize, title: String },
+    DeleteProject { name: String },
+}
+
 impl MenuAction {
     pub const ALL: &'static [(&'static str, MenuAction)] = &[
         ("Settings", MenuAction::Settings),
@@ -75,7 +88,10 @@ pub struct App {
     pub(crate) profile_field_index: usize,
     pub(crate) renaming_session: Option<usize>,
     pub(crate) renaming_project: Option<usize>,
+    pub(crate) showing_help: bool,
     pub(crate) jobs_flash_until: u64,
+    pub(crate) pending_confirm: Option<ConfirmAction>,
+    pub(crate) file_browser: Option<FileBrowser>,
 
     // Interaction state, refreshed each frame by render_*.
     pub(crate) menu_hits: Vec<(Rect, MenuAction)>,
@@ -84,12 +100,111 @@ pub struct App {
     pub(crate) profile_hits: Vec<(Rect, usize)>,
     pub(crate) project_hits: Vec<(Rect, usize)>,
     pub(crate) session_hits: Vec<(Rect, usize)>,
+    pub(crate) file_browser_hits: Vec<(Rect, usize)>,
+    pub(crate) file_browser_button_hits: Vec<(Rect, FileBrowserButton)>,
     pub(crate) hovered_menu: Option<MenuAction>,
     pub(crate) hovered_settings: Option<usize>,
     pub(crate) hovered_profile: Option<usize>,
     pub(crate) hovered_project: Option<usize>,
     pub(crate) hovered_session: Option<usize>,
+    pub(crate) hovered_file_browser: Option<usize>,
     pub(crate) pressed_menu: Option<MenuAction>,
+}
+
+#[derive(Clone)]
+pub struct FileBrowserEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+
+pub struct FileBrowser {
+    pub current_dir: PathBuf,
+    pub entries: Vec<FileBrowserEntry>,
+    pub selected: Vec<PathBuf>,
+    pub cursor: usize,
+    pub scroll_offset: usize,
+}
+
+impl FileBrowser {
+    pub fn new(start: PathBuf) -> Self {
+        let mut fb = FileBrowser {
+            current_dir: start,
+            entries: Vec::new(),
+            selected: Vec::new(),
+            cursor: 0,
+            scroll_offset: 0,
+        };
+        fb.refresh();
+        fb
+    }
+
+    pub fn refresh(&mut self) {
+        self.entries.clear();
+        if let Ok(read) = fs::read_dir(&self.current_dir) {
+            let mut dirs = Vec::new();
+            let mut files = Vec::new();
+            for entry in read.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                // Skip hidden files
+                if name.starts_with('.') {
+                    continue;
+                }
+                let is_dir = path.is_dir();
+                let e = FileBrowserEntry { name, path, is_dir };
+                if is_dir {
+                    dirs.push(e);
+                } else {
+                    files.push(e);
+                }
+            }
+            dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            self.entries.extend(dirs);
+            self.entries.extend(files);
+        }
+    }
+
+    pub fn navigate_into(&mut self, idx: usize) {
+        if let Some(entry) = self.entries.get(idx) {
+            if entry.is_dir {
+                self.current_dir = entry.path.clone();
+                self.cursor = 0;
+                self.scroll_offset = 0;
+                self.refresh();
+            }
+        }
+    }
+
+    pub fn navigate_up(&mut self) {
+        if let Some(parent) = self.current_dir.parent() {
+            self.current_dir = parent.to_path_buf();
+            self.cursor = 0;
+            self.scroll_offset = 0;
+            self.refresh();
+        }
+    }
+
+    pub fn toggle_select(&mut self, idx: usize) {
+        if let Some(entry) = self.entries.get(idx) {
+            if !entry.is_dir {
+                let path = entry.path.clone();
+                if let Some(pos) = self.selected.iter().position(|p| *p == path) {
+                    self.selected.remove(pos);
+                } else {
+                    self.selected.push(path);
+                }
+            }
+        }
+    }
+
+    pub fn is_selected(&self, idx: usize) -> bool {
+        self.entries
+            .get(idx)
+            .map(|e| self.selected.contains(&e.path))
+            .unwrap_or(false)
+    }
 }
 
 impl App {
@@ -165,18 +280,24 @@ impl App {
             profile_field_index: 0,
             renaming_session: None,
             renaming_project: None,
+            showing_help: false,
             jobs_flash_until: 0,
+            pending_confirm: None,
+            file_browser: None,
             menu_hits: Vec::new(),
             tab_hits: Vec::new(),
             settings_hits: Vec::new(),
             profile_hits: Vec::new(),
             project_hits: Vec::new(),
             session_hits: Vec::new(),
+            file_browser_hits: Vec::new(),
+            file_browser_button_hits: Vec::new(),
             hovered_menu: None,
             hovered_settings: None,
             hovered_profile: None,
             hovered_project: None,
             hovered_session: None,
+            hovered_file_browser: None,
             pressed_menu: None,
         };
 
@@ -397,6 +518,70 @@ impl App {
         Ok(())
     }
 
+    pub fn delete_project(&mut self) {
+        let Some(id) = self.active_project_id.clone() else {
+            return;
+        };
+        // Remove project directory from disk
+        let dir = self.paths.projects.join(&id);
+        fs::remove_dir_all(&dir).ok();
+        // Remove from in-memory list
+        self.projects.retain(|p| p.id != id);
+        // Switch back to global scope
+        let _ = self.switch_project(None);
+    }
+
+    pub fn open_file_browser(&mut self) {
+        let start = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        self.file_browser = Some(FileBrowser::new(start));
+    }
+
+    pub fn file_browser_confirm(&mut self) {
+        let fb = match self.file_browser.take() {
+            Some(fb) => fb,
+            None => return,
+        };
+        if fb.selected.is_empty() {
+            return;
+        }
+
+        let dest = &self.current_workspace;
+        let _ = fs::create_dir_all(dest);
+
+        let mut added: Vec<String> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+
+        for src in &fb.selected {
+            let name = src
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unknown".into());
+            let target = dest.join(&name);
+            match fs::copy(src, &target) {
+                Ok(_) => added.push(name),
+                Err(_) => failed.push(name),
+            }
+        }
+
+        if let Some(session) = self.sessions.get_mut(self.active_tab) {
+            let mut msg = format!("Added {} file(s) to workspace:", added.len());
+            for f in &added {
+                msg.push_str(&format!("\n  • {}", f));
+            }
+            if !failed.is_empty() {
+                msg.push_str(&format!("\n\nFailed to copy {} file(s):", failed.len()));
+                for f in &failed {
+                    msg.push_str(&format!("\n  • {}", f));
+                }
+            }
+            session.messages.push(Message {
+                role: Role::Assistant,
+                body: msg,
+                tool_calls: None,
+            });
+        }
+    }
+
     pub fn close_session(&mut self, idx: usize) {
         self.sessions.remove(idx);
         if self.sessions.is_empty() {
@@ -502,12 +687,89 @@ impl App {
             return;
         }
 
+        // Confirmation prompt: only y/n/Esc accepted
+        if self.pending_confirm.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let action = self.pending_confirm.take().unwrap();
+                    match action {
+                        ConfirmAction::DeleteSession { idx, .. } => self.delete_session(idx),
+                        ConfirmAction::DeleteProject { .. } => self.delete_project(),
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.pending_confirm = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // File browser overlay
+        if self.file_browser.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.file_browser = None;
+                }
+                KeyCode::Up => {
+                    if let Some(fb) = &mut self.file_browser {
+                        fb.cursor = fb.cursor.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(fb) = &mut self.file_browser {
+                        if !fb.entries.is_empty() {
+                            fb.cursor = (fb.cursor + 1).min(fb.entries.len() - 1);
+                        }
+                    }
+                }
+                KeyCode::Left | KeyCode::Backspace => {
+                    if let Some(fb) = &mut self.file_browser {
+                        fb.navigate_up();
+                    }
+                }
+                KeyCode::Right => {
+                    if let Some(fb) = &mut self.file_browser {
+                        let idx = fb.cursor;
+                        fb.navigate_into(idx);
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(fb) = &mut self.file_browser {
+                        let idx = fb.cursor;
+                        fb.toggle_select(idx);
+                    }
+                }
+                KeyCode::Enter => {
+                    // If cursor is on a directory, navigate into it;
+                    // otherwise confirm selection
+                    let is_dir = self
+                        .file_browser
+                        .as_ref()
+                        .and_then(|fb| fb.entries.get(fb.cursor))
+                        .map(|e| e.is_dir)
+                        .unwrap_or(false);
+                    if is_dir {
+                        if let Some(fb) = &mut self.file_browser {
+                            let idx = fb.cursor;
+                            fb.navigate_into(idx);
+                        }
+                    } else {
+                        self.file_browser_confirm();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Global escape from renaming/overlays
         if key.code == KeyCode::Esc {
             self.selecting_project = false;
             self.selecting_session = false;
             self.selecting_prompt = false;
             self.selecting_settings = false;
+            self.showing_help = false;
             self.hovered_settings = None;
             self.renaming_session = None;
             self.renaming_project = None;
@@ -689,10 +951,50 @@ impl App {
         if text.is_empty() {
             return;
         }
-        if text == "/new" {
-            session.input.clear();
-            self.new_session();
-            return;
+        // Slash commands
+        let lower = text.to_lowercase();
+        match lower.as_str() {
+            "/new" | "/new session" => {
+                session.input.clear();
+                self.new_session();
+                return;
+            }
+            "/new project" => {
+                session.input.clear();
+                let _ = self.new_project();
+                return;
+            }
+            "/del session" => {
+                let title = session.title.clone();
+                session.input.clear();
+                let idx = self.active_tab;
+                self.pending_confirm = Some(ConfirmAction::DeleteSession { idx, title });
+                return;
+            }
+            "/del project" => {
+                session.input.clear();
+                if let Some(id) = &self.active_project_id {
+                    let name = self
+                        .projects
+                        .iter()
+                        .find(|p| p.id == *id)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| id.clone());
+                    self.pending_confirm = Some(ConfirmAction::DeleteProject { name });
+                }
+                return;
+            }
+            "/help" => {
+                session.input.clear();
+                self.showing_help = true;
+                return;
+            }
+            "/add" => {
+                session.input.clear();
+                self.open_file_browser();
+                return;
+            }
+            _ => {}
         }
         let turn_id = Uuid::new_v4().to_string();
         session.input.clear();
@@ -1056,10 +1358,50 @@ impl App {
                 self.hovered_profile = self.profile_hit(pos);
                 self.hovered_project = self.project_hit(pos);
                 self.hovered_session = self.session_hit(pos);
+                self.hovered_file_browser = self.file_browser_hit(pos);
             }
             MouseEventKind::Down(btn) => {
                 if btn == MouseButton::Left {
                     // Overlays first
+                    if self.file_browser.is_some() {
+                        if let Some(idx) = self.file_browser_hit(pos) {
+                            let is_dir = self
+                                .file_browser
+                                .as_ref()
+                                .and_then(|fb| fb.entries.get(idx))
+                                .map(|e| e.is_dir)
+                                .unwrap_or(false);
+                            if is_dir {
+                                if let Some(fb) = &mut self.file_browser {
+                                    fb.cursor = idx;
+                                    fb.navigate_into(idx);
+                                }
+                            } else {
+                                if let Some(fb) = &mut self.file_browser {
+                                    fb.cursor = idx;
+                                    fb.toggle_select(idx);
+                                }
+                            }
+                            return;
+                        }
+                        // Check for button hits (back / confirm / cancel)
+                        if let Some(action) = self.file_browser_button_hit(pos) {
+                            match action {
+                                FileBrowserButton::Back => {
+                                    if let Some(fb) = &mut self.file_browser {
+                                        fb.navigate_up();
+                                    }
+                                }
+                                FileBrowserButton::Confirm => {
+                                    self.file_browser_confirm();
+                                }
+                                FileBrowserButton::Cancel => {
+                                    self.file_browser = None;
+                                }
+                            }
+                            return;
+                        }
+                    }
                     if self.editing_profile {
                         if let Some(idx) = self.profile_hit(pos) {
                             self.profile_field_index = idx.min(Self::PROFILE_FIELDS.len() - 1);
@@ -1187,6 +1529,20 @@ impl App {
             .map(|(_, i)| *i)
     }
 
+    pub fn file_browser_hit(&self, p: Position) -> Option<usize> {
+        self.file_browser_hits
+            .iter()
+            .find(|(r, _)| r.contains(p))
+            .map(|(_, i)| *i)
+    }
+
+    pub fn file_browser_button_hit(&self, p: Position) -> Option<FileBrowserButton> {
+        self.file_browser_button_hits
+            .iter()
+            .find(|(r, _)| r.contains(p))
+            .map(|(_, action)| *action)
+    }
+
     pub fn fire_menu(&mut self, action: MenuAction) {
         match action {
             MenuAction::Quit => self.running = false,
@@ -1211,7 +1567,13 @@ impl App {
                 self.selecting_project = false;
                 self.selecting_session = false;
             }
-            _ => {}
+            MenuAction::Help => {
+                self.showing_help = !self.showing_help;
+                self.selecting_settings = false;
+                self.selecting_project = false;
+                self.selecting_session = false;
+                self.selecting_prompt = false;
+            }
         }
     }
 
