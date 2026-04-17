@@ -5,6 +5,7 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 
 use crate::agent::WorkerEvent;
+use crate::api::{ModelTurnRequest, ModelTurnResponse, ModelTurnTransport, ToolCall};
 use crate::auth::CodexAuth;
 
 #[derive(Debug, Clone)]
@@ -12,34 +13,31 @@ pub struct CodexClient {
     client: reqwest::blocking::Client,
 }
 
-#[derive(Debug)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub args: Value,
-}
+const LEGACY_RESPONSES_API_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 
 impl CodexClient {
     pub fn new() -> Result<Self> {
         let client = reqwest::blocking::Client::builder().timeout(None).build()?;
         Ok(Self { client })
     }
+}
 
-    pub fn request(
+impl ModelTurnTransport for CodexClient {
+    fn execute_turn(
         &self,
         auth: &CodexAuth,
-        body: &Value,
+        request: &ModelTurnRequest,
         session_id: String,
         turn_id: String,
-        emit_text_events: bool,
         tx: &Sender<WorkerEvent>,
-    ) -> Result<(String, Vec<ToolCall>)> {
+    ) -> Result<ModelTurnResponse> {
         let mut tool_calls = Vec::new();
         let mut text_acc = String::new();
+        let mut last_event = None;
 
         let mut req = self
             .client
-            .post("https://chatgpt.com/backend-api/codex/responses")
+            .post(LEGACY_RESPONSES_API_URL)
             .bearer_auth(&auth.access_token)
             .header("Accept", "text/event-stream")
             .header("OpenAI-Beta", "responses=experimental");
@@ -48,7 +46,7 @@ impl CodexClient {
             req = req.header("ChatGPT-Account-ID", acct);
         }
 
-        let response = req.json(body).send()?;
+        let response = req.json(&request.body).send()?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -67,10 +65,11 @@ impl CodexClient {
                         &data,
                         session_id.clone(),
                         turn_id.clone(),
-                        emit_text_events,
+                        request.emit_text_events,
                         tx,
                         &mut tool_calls,
                         &mut text_acc,
+                        &mut last_event,
                     )
                     .map_err(|e| anyhow!(e))?;
                     data.clear();
@@ -88,10 +87,11 @@ impl CodexClient {
                             &data,
                             session_id.clone(),
                             turn_id.clone(),
-                            emit_text_events,
+                            request.emit_text_events,
                             tx,
                             &mut tool_calls,
                             &mut text_acc,
+                            &mut last_event,
                         )
                         .map_err(|e| anyhow!(e))?;
                         data.clear();
@@ -106,25 +106,33 @@ impl CodexClient {
             }
         }
 
-        // Final flush
         if !data.is_empty() {
             dispatch_sse_event(
                 &data,
                 session_id,
                 turn_id,
-                emit_text_events,
+                request.emit_text_events,
                 tx,
                 &mut tool_calls,
                 &mut text_acc,
+                &mut last_event,
             )
             .ok();
         }
 
-        Ok((text_acc, tool_calls))
+        Ok(ModelTurnResponse {
+            text: text_acc,
+            tool_calls,
+            finish_reason: None,
+            raw_payload: last_event,
+        })
     }
 }
 
 fn find_tool_calls(v: &Value, calls: &mut Vec<ToolCall>) {
+    // Legacy Responses payloads may nest tool calls in several places, but they
+    // are always normalized into the transport-neutral `ToolCall` struct here
+    // before the provider loop sees them.
     if let Some(obj) = v.as_object() {
         if obj.get("type").and_then(|t| t.as_str()) == Some("function_call") {
             let v_obj = Value::Object(obj.clone());
@@ -151,7 +159,7 @@ fn find_tool_calls(v: &Value, calls: &mut Vec<ToolCall>) {
                 args_val
             };
             if !name.is_empty() {
-                calls.push(ToolCall { id, name, args });
+                calls.push(ToolCall::new(id, name, args));
             }
         }
         for value in obj.values() {
@@ -172,15 +180,19 @@ fn dispatch_sse_event(
     tx: &Sender<WorkerEvent>,
     tool_calls: &mut Vec<ToolCall>,
     text_acc: &mut String,
+    last_event: &mut Option<Value>,
 ) -> std::result::Result<bool, String> {
+    // Legacy Responses SSE parser. It expects event names like
+    // `response.output_text.delta` and recursively scans payloads for
+    // `function_call` objects, both of which will need replacement in step 7.
     if data.trim() == "[DONE]" {
         return Ok(true);
     }
     let value: Value = serde_json::from_str(data).map_err(|e| format!("parse sse event: {e}"))?;
+    *last_event = Some(value.clone());
 
     let kind = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-    // Universal tool call search in the whole object
     find_tool_calls(&value, tool_calls);
 
     match kind {
@@ -197,7 +209,6 @@ fn dispatch_sse_event(
             }
         }
         "output" => {
-            // In 'output' event, look for content[].text
             if let Some(content_arr) = value.pointer("/content").and_then(|v| v.as_array()) {
                 for item in content_arr {
                     if item.get("type").and_then(|v| v.as_str()) == Some("text") {

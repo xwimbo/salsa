@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::agent::provider::run_specialist_loop;
 use crate::agent::{ProviderMessage, ProviderRequest, WorkerEvent};
-use crate::api::codex::CodexClient;
+use crate::api::CodexClient;
 use crate::auth::CodexAuth;
 use crate::models::{AgentKind, BackgroundJob, Board, JobStatus, Role};
 use crate::tools::cron::pop_due_tasks;

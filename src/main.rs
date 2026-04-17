@@ -21,7 +21,7 @@ mod tools;
 mod ui;
 
 use agent::provider::{CodexProvider, EchoProvider, Provider};
-use api::codex::CodexClient;
+use api::CodexClient;
 use app::App;
 use tools::Sandbox;
 
@@ -96,6 +96,9 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
 fn main() -> Result<()> {
     install_panic_hook();
     let (cfg, paths) = config::bootstrap()?;
+    // Legacy startup wiring still selects between Codex Responses transport and
+    // the echo fallback directly. Step 13 will replace this with explicit,
+    // configurable provider selection for migration providers.
     let (provider, auth): (Box<dyn Provider>, _) = match auth::CodexAuth::load_from_disk() {
         Ok(auth) => (
             Box::new(CodexProvider::new(auth.clone(), paths.workspace.clone())?),
@@ -105,7 +108,9 @@ fn main() -> Result<()> {
     };
     let worker = agent::worker::spawn_worker(Arc::from(provider));
 
-    // Start background cron scheduler
+    // Start background cron scheduler. This still uses the legacy Codex-backed
+    // transport client, but now through the shared transport abstraction layer in
+    // `src/api/` instead of provider-owned request plumbing.
     if let (Ok(client), Ok(sandbox)) = (CodexClient::new(), Sandbox::new(paths.workspace.clone())) {
         let _cron_handle = agent::cron_scheduler::start_cron_scheduler(
             auth.clone(),

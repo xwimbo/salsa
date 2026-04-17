@@ -8,7 +8,7 @@ use anyhow::Result;
 use uuid::Uuid;
 
 use crate::agent::{ProviderMessage, ProviderRequest, WorkerEvent};
-use crate::api::codex::{CodexClient, ToolCall};
+use crate::api::{CodexClient, ModelTurnRequest, ModelTurnTransport, ToolCall};
 use crate::auth::CodexAuth;
 use crate::models::{
     AgentKind, AgentPhase, BackgroundJob, Board, BoardOperation, ContinuationFrame,
@@ -84,17 +84,17 @@ impl Provider for EchoProvider {
 #[derive(Debug)]
 pub struct CodexProvider {
     auth: CodexAuth,
-    client: CodexClient,
+    transport: CodexClient,
     sandbox: Sandbox,
 }
 
 impl CodexProvider {
     pub fn new(auth: CodexAuth, workspace: PathBuf) -> Result<Self> {
-        let client = CodexClient::new()?;
+        let transport = CodexClient::new()?;
         let sandbox = Sandbox::new(workspace)?;
         Ok(Self {
             auth,
-            client,
+            transport,
             sandbox,
         })
     }
@@ -116,7 +116,7 @@ impl Provider for CodexProvider {
             AgentKind::Coder => {
                 if let Err(err) = run_specialist_turn(
                     &self.auth,
-                    &self.client,
+                    &self.transport,
                     &self.sandbox,
                     request,
                     AgentKind::Coder,
@@ -135,7 +135,7 @@ impl Provider for CodexProvider {
             AgentKind::Analyst => {
                 if let Err(err) = run_specialist_turn(
                     &self.auth,
-                    &self.client,
+                    &self.transport,
                     &self.sandbox,
                     request,
                     AgentKind::Analyst,
@@ -154,7 +154,7 @@ impl Provider for CodexProvider {
             AgentKind::Planner => {
                 if let Err(err) = stream_text_response(
                     &self.auth,
-                    &self.client,
+                    &self.transport,
                     request,
                     session_id.clone(),
                     turn_id.clone(),
@@ -172,7 +172,7 @@ impl Provider for CodexProvider {
                 RouteDecision::Direct => {
                     if let Err(err) = stream_text_response(
                         &self.auth,
-                        &self.client,
+                        &self.transport,
                         request,
                         session_id.clone(),
                         turn_id.clone(),
@@ -189,7 +189,7 @@ impl Provider for CodexProvider {
                 RouteDecision::Planner => {
                     if let Err(err) = stream_text_response(
                         &self.auth,
-                        &self.client,
+                        &self.transport,
                         request,
                         session_id.clone(),
                         turn_id.clone(),
@@ -206,7 +206,7 @@ impl Provider for CodexProvider {
                 RouteDecision::Analyst => {
                     spawn_background_specialist(
                         &self.auth,
-                        &self.client,
+                        &self.transport,
                         &self.sandbox,
                         request,
                         AgentKind::Analyst,
@@ -219,7 +219,7 @@ impl Provider for CodexProvider {
                 RouteDecision::Coder => {
                     spawn_background_specialist(
                         &self.auth,
-                        &self.client,
+                        &self.transport,
                         &self.sandbox,
                         request,
                         AgentKind::Coder,
@@ -236,7 +236,7 @@ impl Provider for CodexProvider {
 
 fn spawn_background_specialist(
     auth: &CodexAuth,
-    client: &CodexClient,
+    transport: &CodexClient,
     sandbox: &Sandbox,
     request: &ProviderRequest,
     agent: AgentKind,
@@ -271,7 +271,7 @@ fn spawn_background_specialist(
     });
 
     let auth = auth.clone();
-    let client = client.clone();
+    let transport = transport.clone();
     let sandbox = sandbox.clone();
     let mut specialist_request = request.clone();
     specialist_request.agent = agent;
@@ -287,7 +287,7 @@ fn spawn_background_specialist(
 
         match run_background_specialist_job(
             &auth,
-            &client,
+            &transport,
             &sandbox,
             &specialist_request,
             session_id_for_job.clone(),
@@ -331,27 +331,15 @@ fn spawn_background_specialist(
 
 fn stream_text_response(
     auth: &CodexAuth,
-    client: &CodexClient,
+    transport: &dyn ModelTurnTransport,
     request: &ProviderRequest,
     session_id: String,
     turn_id: String,
     tx: &Sender<WorkerEvent>,
     instructions: String,
 ) -> Result<()> {
-    let input: Vec<serde_json::Value> = request.messages.iter().map(|m| m.as_json()).collect();
-    let body = serde_json::json!({
-        "model": request.model,
-        "instructions": instructions,
-        "input": input,
-        "tools": [],
-        "tool_choice": "none",
-        "parallel_tool_calls": false,
-        "reasoning": null,
-        "store": false,
-        "stream": true,
-    });
-
-    client.request(auth, &body, session_id.clone(), turn_id.clone(), true, tx)?;
+    let turn_request = build_direct_turn_request(request, instructions);
+    transport.execute_turn(auth, &turn_request, session_id.clone(), turn_id.clone(), tx)?;
     let _ = tx.send(WorkerEvent::Done {
         session_id,
         turn_id,
@@ -481,11 +469,6 @@ pub(crate) fn run_specialist_loop(
                     attachments: Vec::new(),
                 })
                 .collect();
-            let input: Vec<serde_json::Value> = conversation
-                .iter()
-                .chain(continuation_messages.iter())
-                .map(|m| m.as_json())
-                .collect();
 
             let instructions = build_specialist_instructions(request, &board, phase, agent, label);
             let allowed_tools = tools::tool_specs_for_agent_phase(agent, phase, is_subagent);
@@ -505,24 +488,29 @@ pub(crate) fn run_specialist_loop(
                 .or_else(|| background_job.map(|(session_id, _, _)| session_id.to_string()))
                 .unwrap_or_default();
 
-            let body = serde_json::json!({
-                "model": request.model,
-                "instructions": instructions,
-                "input": input,
-                "tools": allowed_tools,
-                "tool_choice": tool_choice,
-                "parallel_tool_calls": false,
-                "reasoning": null,
-                "store": false,
-                "stream": true,
-            });
+            let turn_request = build_specialist_turn_request(
+                request,
+                &conversation,
+                &continuation_messages,
+                instructions,
+                allowed_tools,
+                tool_choice,
+                emit_text,
+            );
 
             let tx = interactive_turn
                 .map(|(_, _, tx)| tx)
                 .or_else(|| background_job.map(|(_, _, tx)| tx))
                 .expect("coder loop requires a sender");
-            let (text_content, tool_calls) =
-                client.request(auth, &body, session_key.clone(), turn_key.clone(), emit_text, tx)?;
+            let turn_response = client.execute_turn(
+                auth,
+                &turn_request,
+                session_key.clone(),
+                turn_key.clone(),
+                tx,
+            )?;
+            let text_content = turn_response.text;
+            let tool_calls = turn_response.tool_calls;
 
             let unique_calls = dedupe_tool_calls(tool_calls);
             let used_tools_this_iteration = !unique_calls.is_empty();
@@ -1032,7 +1020,85 @@ fn summarize_job_title(request: &ProviderRequest) -> String {
     }
 }
 
+fn build_direct_turn_request(request: &ProviderRequest, instructions: String) -> ModelTurnRequest {
+    let input: Vec<serde_json::Value> = request.messages.iter().map(|m| m.as_json()).collect();
+    let chat_messages = build_chat_completion_messages(&request.messages, &instructions);
+    ModelTurnRequest {
+        body: serde_json::json!({
+            "model": request.model,
+            "instructions": instructions,
+            "input": input,
+            "tools": [],
+            "tool_choice": "none",
+            "parallel_tool_calls": false,
+            "reasoning": null,
+            "store": false,
+            "stream": true,
+            "_chat_completions_preview": {
+                "messages": chat_messages,
+                "tools": [],
+            },
+        }),
+        emit_text_events: true,
+    }
+}
+
+fn build_specialist_turn_request(
+    request: &ProviderRequest,
+    conversation: &[ProviderMessage],
+    continuation_messages: &[ProviderMessage],
+    instructions: String,
+    allowed_tools: Vec<serde_json::Value>,
+    tool_choice: &str,
+    emit_text_events: bool,
+) -> ModelTurnRequest {
+    let combined_messages: Vec<ProviderMessage> = conversation
+        .iter()
+        .chain(continuation_messages.iter())
+        .cloned()
+        .collect();
+    let input: Vec<serde_json::Value> = combined_messages.iter().map(|m| m.as_json()).collect();
+    let chat_messages = build_chat_completion_messages(&combined_messages, &instructions);
+    let chat_tools = allowed_tools.clone();
+
+    ModelTurnRequest {
+        body: serde_json::json!({
+            "model": request.model,
+            "instructions": instructions,
+            "input": input,
+            "tools": allowed_tools,
+            "tool_choice": tool_choice,
+            "parallel_tool_calls": false,
+            "reasoning": null,
+            "store": false,
+            "stream": true,
+            "_chat_completions_preview": {
+                "messages": chat_messages,
+                "tools": chat_tools,
+            },
+        }),
+        emit_text_events,
+    }
+}
+
+fn build_chat_completion_messages(
+    messages: &[ProviderMessage],
+    instructions: &str,
+) -> Vec<serde_json::Value> {
+    let mut serialized = Vec::with_capacity(messages.len() + 1);
+    if !instructions.trim().is_empty() {
+        serialized.push(serde_json::json!({
+            "role": "system",
+            "content": instructions,
+        }));
+    }
+    serialized.extend(messages.iter().map(ProviderMessage::as_chat_completion_message));
+    serialized
+}
+
 fn dedupe_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<ToolCall> {
+    // The specialist loop stays transport-agnostic by consuming the canonical
+    // `ToolCall { id, name, args }` representation regardless of provider.
     let mut calls_map: HashMap<String, ToolCall> = HashMap::new();
     for tc in tool_calls {
         let is_empty = tc.args.is_null()

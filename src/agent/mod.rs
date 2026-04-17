@@ -33,6 +33,9 @@ pub struct ProviderMessage {
 
 impl ProviderMessage {
     pub fn as_json(&self) -> serde_json::Value {
+        // Legacy Responses transport serializer. This intentionally emits
+        // `input_text`/`output_text` content items instead of Chat Completions
+        // `messages`, so migration work can isolate and replace this path later.
         let mut content = Vec::new();
         match self.role {
             Role::User | Role::System | Role::ToolResult => {
@@ -62,6 +65,47 @@ impl ProviderMessage {
             Role::System | Role::ToolResult => serde_json::json!({ "role": "system", "content": content }),
         }
     }
+
+    pub fn as_chat_completion_message(&self) -> serde_json::Value {
+        let role = match self.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::System => "system",
+            // Until step 9 defines native tool-result feedback, keep tool results
+            // as synthetic system context in the Chat Completions message stream.
+            Role::ToolResult => "system",
+        };
+
+        let mut content = Vec::new();
+        if !self.content.is_empty() {
+            content.push(serde_json::json!({
+                "type": "text",
+                "text": self.content,
+            }));
+        }
+        for attachment in &self.attachments {
+            if let Some(item) = attachment.as_chat_completion_content_part() {
+                content.push(item);
+            }
+        }
+
+        if content.is_empty() {
+            serde_json::json!({
+                "role": role,
+                "content": self.content,
+            })
+        } else if content.len() == 1 && content[0].get("type").and_then(|v| v.as_str()) == Some("text") {
+            serde_json::json!({
+                "role": role,
+                "content": content[0].get("text").cloned().unwrap_or_else(|| serde_json::json!("")),
+            })
+        } else {
+            serde_json::json!({
+                "role": role,
+                "content": content,
+            })
+        }
+    }
 }
 
 impl ProviderAttachment {
@@ -83,6 +127,31 @@ impl ProviderAttachment {
                 "filename": filename,
                 "file_data": format!("data:{};base64,{}", mime_type, data_base64),
             }),
+        }
+    }
+
+    fn as_chat_completion_content_part(&self) -> Option<serde_json::Value> {
+        match self {
+            ProviderAttachment::Image {
+                mime_type,
+                data_base64,
+            } => Some(serde_json::json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", mime_type, data_base64),
+                }
+            })),
+            ProviderAttachment::File {
+                mime_type,
+                filename,
+                data_base64,
+            } => Some(serde_json::json!({
+                "type": "file",
+                "file": {
+                    "filename": filename,
+                    "file_data": format!("data:{};base64,{}", mime_type, data_base64),
+                }
+            })),
         }
     }
 }

@@ -20,7 +20,7 @@ pub use sandbox::Sandbox;
 use serde_json::{json, Value};
 
 use crate::agent::WorkerEvent;
-use crate::api::codex::CodexClient;
+use crate::api::CodexClient;
 use crate::auth::CodexAuth;
 use crate::models::{AgentKind, AgentPhase, BoardOperation};
 
@@ -38,12 +38,16 @@ pub struct SalsaToolContext<'a> {
 }
 
 pub fn tool_specs_for_agent_phase(agent: AgentKind, phase: AgentPhase, is_subagent: bool) -> Vec<Value> {
-    match agent {
+    let legacy_specs = match agent {
         AgentKind::Analyst => analyst_tool_specs_for_phase(phase),
         AgentKind::Orchestrator | AgentKind::Planner | AgentKind::Coder => {
             default_tool_specs_for_phase(phase, is_subagent)
         }
-    }
+    };
+    legacy_specs
+        .into_iter()
+        .map(wrap_chat_completion_tool_spec)
+        .collect()
 }
 
 pub fn tool_slug(name: &str, args: &Value) -> String {
@@ -405,7 +409,43 @@ fn string_arg<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow!("missing or non-string arg `{}`", key))
 }
 
+fn wrap_chat_completion_tool_spec(spec: Value) -> Value {
+    if spec.get("function").is_some() {
+        return spec;
+    }
+
+    // Current tool builders still emit the legacy flattened schema shape.
+    // Wrap them here so the transport layer can preview/request Chat
+    // Completions-compatible `tools[].function.{name,description,parameters}`
+    // without changing any tool executor or per-tool spec builder yet.
+    let name = spec.get("name").cloned().unwrap_or_else(|| json!(""));
+    let description = spec
+        .get("description")
+        .cloned()
+        .unwrap_or_else(|| json!(""));
+    let parameters = spec
+        .get("parameters")
+        .cloned()
+        .unwrap_or_else(|| json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false,
+        }));
+
+    json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        }
+    })
+}
+
 fn fs_read_spec() -> Value {
+    // Legacy Responses transport schema. Chat Completions-compatible providers
+    // usually require these fields nested under `function`, so step 5 will
+    // either wrap or replace this shape.
     json!({
         "type": "function",
         "name": "fs_read",
