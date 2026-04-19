@@ -442,6 +442,58 @@ fn wrap_chat_completion_tool_spec(spec: Value) -> Value {
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::wrap_chat_completion_tool_spec;
+    use serde_json::json;
+
+    #[test]
+    fn wraps_flattened_tool_spec_for_chat_completions() {
+        let wrapped = wrap_chat_completion_tool_spec(json!({
+            "type": "function",
+            "name": "fs_read",
+            "description": "Read a file",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"}
+                }
+            }
+        }));
+
+        assert_eq!(
+            wrapped,
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "fs_read",
+                    "description": "Read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"}
+                        }
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn preserves_already_wrapped_tool_spec() {
+        let spec = json!({
+            "type": "function",
+            "function": {
+                "name": "fs_list",
+                "description": "List files",
+                "parameters": {"type": "object"}
+            }
+        });
+
+        assert_eq!(wrap_chat_completion_tool_spec(spec.clone()), spec);
+    }
+}
+
 fn fs_read_spec() -> Value {
     // Legacy Responses transport schema. Chat Completions-compatible providers
     // usually require these fields nested under `function`, so step 5 will

@@ -68,6 +68,7 @@ pub fn start_cron_scheduler(
                             role: Role::User,
                             content: task.prompt.clone(),
                             tool_calls: None,
+                            tool_call_id: None,
                             attachments: Vec::new(),
                         }],
                         model,

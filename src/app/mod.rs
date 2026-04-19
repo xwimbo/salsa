@@ -374,6 +374,11 @@ impl App {
             sid: self.sid.clone(),
             email: self.email.clone(),
             api_key: self.api_key.clone(),
+            provider_kind: self.provider_label.to_string(),
+            local_provider_base_url: "http://127.0.0.1:11434/v1/chat/completions".into(),
+            local_provider_api_key: "local-dev-token".into(),
+            local_provider_model: self.default_model.clone(),
+            local_provider_timeout_secs: 120,
         };
         let text = serde_yaml::to_string(&config)?;
         fs::write(&self.paths.config_file, text)?;
@@ -1023,6 +1028,7 @@ impl App {
                 role: m.role,
                 content: m.body.clone(),
                 tool_calls: m.tool_calls.clone(),
+                tool_call_id: None,
                 attachments: Vec::new(),
             })
             .collect();

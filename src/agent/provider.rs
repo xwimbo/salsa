@@ -8,7 +8,10 @@ use anyhow::Result;
 use uuid::Uuid;
 
 use crate::agent::{ProviderMessage, ProviderRequest, WorkerEvent};
-use crate::api::{CodexClient, ModelTurnRequest, ModelTurnTransport, ToolCall};
+use crate::api::{
+    ChatCompletionsRequestBuilder, CodexClient, LocalChatCompletionsClient, ModelTurnRequest,
+    ModelTurnTransport, ToolCall,
+};
 use crate::auth::CodexAuth;
 use crate::models::{
     AgentKind, AgentPhase, BackgroundJob, Board, BoardOperation, ContinuationFrame,
@@ -81,11 +84,107 @@ impl Provider for EchoProvider {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct StubCompletionsProvider {
+    sandbox: Sandbox,
+}
+
+impl StubCompletionsProvider {
+    pub fn new(workspace: PathBuf) -> Result<Self> {
+        Ok(Self {
+            sandbox: Sandbox::new(workspace)?,
+        })
+    }
+}
+
+impl Provider for StubCompletionsProvider {
+    fn label(&self) -> &'static str {
+        "stub"
+    }
+
+    fn generate(
+        &self,
+        request: &ProviderRequest,
+        session_id: String,
+        turn_id: String,
+        tx: &Sender<WorkerEvent>,
+    ) {
+        let result = match request.agent {
+            AgentKind::Coder => run_stub_specialist_turn(
+                &self.sandbox,
+                request,
+                AgentKind::Coder,
+                "coder",
+                session_id.clone(),
+                turn_id.clone(),
+                tx,
+            ),
+            AgentKind::Analyst => run_stub_specialist_turn(
+                &self.sandbox,
+                request,
+                AgentKind::Analyst,
+                "analyst",
+                session_id.clone(),
+                turn_id.clone(),
+                tx,
+            ),
+            AgentKind::Planner => {
+                stream_stub_text_response(request, session_id.clone(), turn_id.clone(), tx, true)
+            }
+            AgentKind::Orchestrator => match route_request(request) {
+                RouteDecision::Direct | RouteDecision::Planner => {
+                    stream_stub_text_response(request, session_id.clone(), turn_id.clone(), tx, true)
+                }
+                RouteDecision::Analyst => run_stub_specialist_turn(
+                    &self.sandbox,
+                    request,
+                    AgentKind::Analyst,
+                    "analyst",
+                    session_id.clone(),
+                    turn_id.clone(),
+                    tx,
+                ),
+                RouteDecision::Coder => run_stub_specialist_turn(
+                    &self.sandbox,
+                    request,
+                    AgentKind::Coder,
+                    "coder",
+                    session_id.clone(),
+                    turn_id.clone(),
+                    tx,
+                ),
+            },
+        };
+
+        match result {
+            Ok(()) => {
+                let _ = tx.send(WorkerEvent::Done {
+                    session_id,
+                    turn_id,
+                });
+            }
+            Err(err) => {
+                let _ = tx.send(WorkerEvent::Error {
+                    session_id,
+                    turn_id,
+                    err: err.to_string(),
+                });
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CodexProvider {
     auth: CodexAuth,
     transport: CodexClient,
     sandbox: Sandbox,
+}
+
+#[derive(Debug)]
+pub struct LocalChatCompletionsProvider {
+    auth: CodexAuth,
+    transport: LocalChatCompletionsClient,
 }
 
 impl CodexProvider {
@@ -97,6 +196,20 @@ impl CodexProvider {
             transport,
             sandbox,
         })
+    }
+}
+
+impl LocalChatCompletionsProvider {
+    pub fn new(
+        auth: CodexAuth,
+        workspace: PathBuf,
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let transport = LocalChatCompletionsClient::new(base_url, api_key, timeout)?;
+        let _ = Sandbox::new(workspace)?;
+        Ok(Self { auth, transport })
     }
 }
 
@@ -112,49 +225,157 @@ impl Provider for CodexProvider {
         turn_id: String,
         tx: &Sender<WorkerEvent>,
     ) {
-        match request.agent {
-            AgentKind::Coder => {
-                if let Err(err) = run_specialist_turn(
-                    &self.auth,
-                    &self.transport,
-                    &self.sandbox,
-                    request,
-                    AgentKind::Coder,
-                    "coder",
-                    session_id.clone(),
-                    turn_id.clone(),
-                    tx,
-                ) {
-                    let _ = tx.send(WorkerEvent::Error {
-                        session_id,
-                        turn_id,
-                        err: err.to_string(),
-                    });
-                }
+        generate_codex_provider(
+            &self.auth,
+            &self.transport,
+            &self.sandbox,
+            request,
+            session_id,
+            turn_id,
+            tx,
+        );
+    }
+}
+
+impl Provider for LocalChatCompletionsProvider {
+    fn label(&self) -> &'static str {
+        "local"
+    }
+
+    fn generate(
+        &self,
+        request: &ProviderRequest,
+        session_id: String,
+        turn_id: String,
+        tx: &Sender<WorkerEvent>,
+    ) {
+        let result = match request.agent {
+            AgentKind::Coder | AgentKind::Analyst => stream_text_response(
+                &self.auth,
+                &self.transport,
+                request,
+                session_id.clone(),
+                turn_id.clone(),
+                tx,
+                orchestrator_instructions(request),
+            ),
+            AgentKind::Planner => stream_text_response(
+                &self.auth,
+                &self.transport,
+                request,
+                session_id.clone(),
+                turn_id.clone(),
+                tx,
+                planner_instructions(request),
+            ),
+            AgentKind::Orchestrator => stream_text_response(
+                &self.auth,
+                &self.transport,
+                request,
+                session_id.clone(),
+                turn_id.clone(),
+                tx,
+                orchestrator_instructions(request),
+            ),
+        };
+
+        if let Err(err) = result {
+            let _ = tx.send(WorkerEvent::Error {
+                session_id,
+                turn_id,
+                err: err.to_string(),
+            });
+        }
+    }
+}
+
+fn generate_codex_provider(
+    auth: &CodexAuth,
+    transport: &CodexClient,
+    sandbox: &Sandbox,
+    request: &ProviderRequest,
+    session_id: String,
+    turn_id: String,
+    tx: &Sender<WorkerEvent>,
+) {
+    match request.agent {
+        AgentKind::Coder => {
+            if let Err(err) = run_specialist_turn(
+                auth,
+                transport,
+                sandbox,
+                request,
+                AgentKind::Coder,
+                "coder",
+                session_id.clone(),
+                turn_id.clone(),
+                tx,
+            ) {
+                let _ = tx.send(WorkerEvent::Error {
+                    session_id,
+                    turn_id,
+                    err: err.to_string(),
+                });
             }
-            AgentKind::Analyst => {
-                if let Err(err) = run_specialist_turn(
-                    &self.auth,
-                    &self.transport,
-                    &self.sandbox,
-                    request,
-                    AgentKind::Analyst,
-                    "analyst",
-                    session_id.clone(),
-                    turn_id.clone(),
-                    tx,
-                ) {
-                    let _ = tx.send(WorkerEvent::Error {
-                        session_id,
-                        turn_id,
-                        err: err.to_string(),
-                    });
-                }
+        }
+        AgentKind::Analyst => {
+            if let Err(err) = run_specialist_turn(
+                auth,
+                transport,
+                sandbox,
+                request,
+                AgentKind::Analyst,
+                "analyst",
+                session_id.clone(),
+                turn_id.clone(),
+                tx,
+            ) {
+                let _ = tx.send(WorkerEvent::Error {
+                    session_id,
+                    turn_id,
+                    err: err.to_string(),
+                });
             }
-            AgentKind::Planner => {
+        }
+        AgentKind::Planner => {
+            if let Err(err) = stream_text_response(
+                auth,
+                transport,
+                request,
+                session_id.clone(),
+                turn_id.clone(),
+                tx,
+                planner_instructions(request),
+            ) {
+                let _ = tx.send(WorkerEvent::Error {
+                    session_id,
+                    turn_id,
+                    err: err.to_string(),
+                });
+            }
+        }
+        AgentKind::Orchestrator => match route_request(request) {
+            RouteDecision::Direct => {
                 if let Err(err) = stream_text_response(
-                    &self.auth,
-                    &self.transport,
+                    auth,
+                    transport,
+                    request,
+                    session_id.clone(),
+                    turn_id.clone(),
+                    tx,
+                    orchestrator_instructions(request),
+                ) {
+                    let _ = tx.send(WorkerEvent::Error {
+                        session_id,
+                        turn_id,
+                        err: err.to_string(),
+                    });
+                }
+            }
+            RouteDecision::Planner => {
+                if let Err(err) = stream_text_response(
+                    auth,
+                    transport,
                     request,
                     session_id.clone(),
                     turn_id.clone(),
@@ -168,69 +389,33 @@ impl Provider for CodexProvider {
                     });
                 }
             }
-            AgentKind::Orchestrator => match route_request(request) {
-                RouteDecision::Direct => {
-                    if let Err(err) = stream_text_response(
-                        &self.auth,
-                        &self.transport,
-                        request,
-                        session_id.clone(),
-                        turn_id.clone(),
-                        tx,
-                        orchestrator_instructions(request),
-                    ) {
-                        let _ = tx.send(WorkerEvent::Error {
-                            session_id,
-                            turn_id,
-                            err: err.to_string(),
-                        });
-                    }
-                }
-                RouteDecision::Planner => {
-                    if let Err(err) = stream_text_response(
-                        &self.auth,
-                        &self.transport,
-                        request,
-                        session_id.clone(),
-                        turn_id.clone(),
-                        tx,
-                        planner_instructions(request),
-                    ) {
-                        let _ = tx.send(WorkerEvent::Error {
-                            session_id,
-                            turn_id,
-                            err: err.to_string(),
-                        });
-                    }
-                }
-                RouteDecision::Analyst => {
-                    spawn_background_specialist(
-                        &self.auth,
-                        &self.transport,
-                        &self.sandbox,
-                        request,
-                        AgentKind::Analyst,
-                        "data analysis",
-                        session_id,
-                        turn_id,
-                        tx,
-                    );
-                }
-                RouteDecision::Coder => {
-                    spawn_background_specialist(
-                        &self.auth,
-                        &self.transport,
-                        &self.sandbox,
-                        request,
-                        AgentKind::Coder,
-                        "coding",
-                        session_id,
-                        turn_id,
-                        tx,
-                    );
-                }
-            },
-        }
+            RouteDecision::Analyst => {
+                spawn_background_specialist(
+                    auth,
+                    transport,
+                    sandbox,
+                    request,
+                    AgentKind::Analyst,
+                    "data analysis",
+                    session_id,
+                    turn_id,
+                    tx,
+                );
+            }
+            RouteDecision::Coder => {
+                spawn_background_specialist(
+                    auth,
+                    transport,
+                    sandbox,
+                    request,
+                    AgentKind::Coder,
+                    "coding",
+                    session_id,
+                    turn_id,
+                    tx,
+                );
+            }
+        },
     }
 }
 
@@ -404,6 +589,253 @@ fn run_background_specialist_job(
     )
 }
 
+fn run_stub_specialist_turn(
+    sandbox: &Sandbox,
+    request: &ProviderRequest,
+    agent: AgentKind,
+    label: &str,
+    session_id: String,
+    turn_id: String,
+    tx: &Sender<WorkerEvent>,
+) -> Result<()> {
+    let summary = run_stub_specialist_loop(
+        sandbox,
+        request,
+        agent,
+        label,
+        Some((&session_id, &turn_id, tx)),
+    )?;
+    let _ = summary;
+    Ok(())
+}
+
+fn stream_stub_text_response(
+    request: &ProviderRequest,
+    session_id: String,
+    turn_id: String,
+    tx: &Sender<WorkerEvent>,
+    include_done: bool,
+) -> Result<()> {
+    let reply = stub_plain_response(request);
+    stream_stub_delta_chunks(&reply, &session_id, &turn_id, tx)?;
+    if include_done {
+        let _ = tx.send(WorkerEvent::Done {
+            session_id,
+            turn_id,
+        });
+    }
+    Ok(())
+}
+
+fn run_stub_specialist_loop(
+    sandbox: &Sandbox,
+    request: &ProviderRequest,
+    agent: AgentKind,
+    label: &str,
+    interactive_turn: Option<(&str, &str, &Sender<WorkerEvent>)>,
+) -> Result<String> {
+    let mut conversation = request.messages.clone();
+    let mut board = request
+        .board
+        .clone()
+        .unwrap_or_default()
+        .normalized_for_prompt();
+    let last_user = latest_user_message(&conversation);
+    let plan = StubToolPlan::from_prompt(&last_user, agent);
+    let mut continuation_frames: Vec<ContinuationFrame> = Vec::new();
+    let mut final_response = String::new();
+
+    for phase in AgentPhase::ALL {
+        if let Some((session_id, turn_id, tx)) = interactive_turn {
+            let _ = tx.send(WorkerEvent::PhaseChange {
+                session_id: session_id.to_string(),
+                turn_id: turn_id.to_string(),
+                phase,
+            });
+            let _ = tx.send(WorkerEvent::StepUpdate {
+                session_id: session_id.to_string(),
+                turn_id: turn_id.to_string(),
+                phase,
+                status: TurnStepStatus::Running,
+                summary: Some(format!("stub {}", phase.status())),
+            });
+            let _ = tx.send(WorkerEvent::ToolStatus {
+                session_id: session_id.to_string(),
+                turn_id: turn_id.to_string(),
+                status: format!("stub {}", phase.status()),
+            });
+        }
+
+        board.apply_operations(&[BoardOperation::SetLastPhase { phase }]);
+        let mut step_summary = format!("stub {} complete", phase.as_str());
+
+        match phase {
+            AgentPhase::Plan => {
+                let plan_note = stub_phase_note(label, phase, &last_user, &plan);
+                continuation_frames.push(build_continuation_frame(
+                    phase,
+                    &plan_note,
+                    vec![ExecutionArtifact::AssistantNote {
+                        text: plan_note.clone(),
+                    }],
+                ));
+                compact_continuation_frames(&mut continuation_frames);
+                step_summary = plan_note.clone();
+                if let Some((session_id, turn_id, tx)) = interactive_turn {
+                    let _ = tx.send(WorkerEvent::StepArtifact {
+                        session_id: session_id.to_string(),
+                        turn_id: turn_id.to_string(),
+                        phase,
+                        artifact: ExecutionArtifact::AssistantNote { text: plan_note },
+                    });
+                }
+            }
+            AgentPhase::Explore | AgentPhase::Act | AgentPhase::Verify => {
+                if let Some(stub_call) = plan.call_for_phase(phase) {
+                    let tool_call = stub_call.to_tool_call(phase);
+                    let assistant_tool_calls = serde_json::json!([tool_call.as_chat_completion_call()]);
+                    conversation.push(ProviderMessage {
+                        role: Role::Assistant,
+                        content: stub_call.assistant_preface(phase),
+                        tool_calls: Some(assistant_tool_calls.clone()),
+                        tool_call_id: None,
+                        attachments: Vec::new(),
+                    });
+
+                    if let Some((session_id, turn_id, tx)) = interactive_turn {
+                        let _ = tx.send(WorkerEvent::ToolCalls {
+                            session_id: session_id.to_string(),
+                            turn_id: turn_id.to_string(),
+                            calls: assistant_tool_calls,
+                        });
+                        let _ = tx.send(WorkerEvent::SystemNote {
+                            session_id: session_id.to_string(),
+                            turn_id: turn_id.to_string(),
+                            note: tools::tool_slug(&tool_call.name, &tool_call.args),
+                        });
+                        let _ = tx.send(WorkerEvent::StepArtifact {
+                            session_id: session_id.to_string(),
+                            turn_id: turn_id.to_string(),
+                            phase,
+                            artifact: ExecutionArtifact::ToolCall {
+                                tool_name: tool_call.name.clone(),
+                                args: tool_call.args.clone(),
+                            },
+                        });
+                    }
+
+                    let execution = execute_stub_tool(sandbox, &tool_call)?;
+                    if !execution.board_ops.is_empty() {
+                        board.apply_operations(&execution.board_ops);
+                    }
+
+                    conversation.push(ProviderMessage {
+                        role: Role::ToolResult,
+                        content: execution.output.clone(),
+                        tool_calls: None,
+                        tool_call_id: Some(tool_call.id.clone()),
+                        attachments: Vec::new(),
+                    });
+
+                    if let Some((session_id, turn_id, tx)) = interactive_turn {
+                        if !execution.board_ops.is_empty() {
+                            let _ = tx.send(WorkerEvent::StepArtifact {
+                                session_id: session_id.to_string(),
+                                turn_id: turn_id.to_string(),
+                                phase,
+                                artifact: ExecutionArtifact::BoardOps {
+                                    operations: execution.board_ops.clone(),
+                                },
+                            });
+                            let _ = tx.send(WorkerEvent::BoardUpdate {
+                                session_id: session_id.to_string(),
+                                turn_id: turn_id.to_string(),
+                                project_id: request.project_id.clone(),
+                                operations: execution.board_ops.clone(),
+                            });
+                        }
+                        let _ = tx.send(WorkerEvent::StepArtifact {
+                            session_id: session_id.to_string(),
+                            turn_id: turn_id.to_string(),
+                            phase,
+                            artifact: ExecutionArtifact::ToolResult {
+                                tool_name: tool_call.name.clone(),
+                                output: execution.output.clone(),
+                            },
+                        });
+                    }
+
+                    let assistant_note = format!(
+                        "Stub {} phase used {} and observed: {}",
+                        phase.as_str(),
+                        tool_call.name,
+                        execution.output
+                    );
+                    continuation_frames.push(build_continuation_frame(
+                        phase,
+                        &assistant_note,
+                        vec![
+                            ExecutionArtifact::ToolCall {
+                                tool_name: tool_call.name.clone(),
+                                args: tool_call.args.clone(),
+                            },
+                            ExecutionArtifact::ToolResult {
+                                tool_name: tool_call.name.clone(),
+                                output: execution.output.clone(),
+                            },
+                        ],
+                    ));
+                    compact_continuation_frames(&mut continuation_frames);
+                    step_summary = assistant_note;
+                } else {
+                    let note = format!("Stub {} phase needed no tool call.", phase.as_str());
+                    continuation_frames.push(build_continuation_frame(
+                        phase,
+                        &note,
+                        vec![ExecutionArtifact::AssistantNote { text: note.clone() }],
+                    ));
+                    compact_continuation_frames(&mut continuation_frames);
+                    step_summary = note.clone();
+                    if let Some((session_id, turn_id, tx)) = interactive_turn {
+                        let _ = tx.send(WorkerEvent::StepArtifact {
+                            session_id: session_id.to_string(),
+                            turn_id: turn_id.to_string(),
+                            phase,
+                            artifact: ExecutionArtifact::AssistantNote { text: note },
+                        });
+                    }
+                }
+            }
+            AgentPhase::Respond => {
+                final_response = stub_final_response(label, &last_user, &plan, &conversation);
+                if let Some((session_id, turn_id, tx)) = interactive_turn {
+                    stream_stub_delta_chunks(&final_response, session_id, turn_id, tx)?;
+                }
+                conversation.push(ProviderMessage {
+                    role: Role::Assistant,
+                    content: final_response.clone(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    attachments: Vec::new(),
+                });
+                step_summary = final_response.clone();
+            }
+        }
+
+        if let Some((session_id, turn_id, tx)) = interactive_turn {
+            let _ = tx.send(WorkerEvent::StepUpdate {
+                session_id: session_id.to_string(),
+                turn_id: turn_id.to_string(),
+                phase,
+                status: TurnStepStatus::Completed,
+                summary: Some(step_summary),
+            });
+        }
+    }
+
+    Ok(final_response)
+}
+
 pub(crate) fn run_specialist_loop(
     auth: &CodexAuth,
     client: &CodexClient,
@@ -466,6 +898,7 @@ pub(crate) fn run_specialist_loop(
                     role: Role::System,
                     content: frame.as_system_text(),
                     tool_calls: None,
+                    tool_call_id: None,
                     attachments: Vec::new(),
                 })
                 .collect();
@@ -515,23 +948,32 @@ pub(crate) fn run_specialist_loop(
             let unique_calls = dedupe_tool_calls(tool_calls);
             let used_tools_this_iteration = !unique_calls.is_empty();
             if !unique_calls.is_empty() {
-                if let Some((session_id, turn_id, tx)) = interactive_turn {
-                    let calls_json = serde_json::json!(unique_calls
-                        .iter()
-                        .map(|tc| {
-                            serde_json::json!({
-                                "id": tc.id,
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": tc.args,
-                                }
-                            })
+                let assistant_tool_calls = serde_json::json!(unique_calls
+                    .iter()
+                    .map(|tc| {
+                        serde_json::json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": serde_json::to_string(&tc.args).unwrap_or_else(|_| "null".to_string()),
+                            }
                         })
-                        .collect::<Vec<_>>());
+                    })
+                    .collect::<Vec<_>>());
+                conversation.push(ProviderMessage {
+                    role: Role::Assistant,
+                    content: text_content.clone(),
+                    tool_calls: Some(assistant_tool_calls.clone()),
+                    tool_call_id: None,
+                    attachments: Vec::new(),
+                });
+
+                if let Some((session_id, turn_id, tx)) = interactive_turn {
                     let _ = tx.send(WorkerEvent::ToolCalls {
                         session_id: session_id.to_string(),
                         turn_id: turn_id.to_string(),
-                        calls: calls_json,
+                        calls: assistant_tool_calls,
                     });
                 }
 
@@ -575,6 +1017,14 @@ pub(crate) fn run_specialist_loop(
                         custom_prompt: request.custom_prompt.as_deref(),
                         is_subagent,
                     };
+                    if let Some((session_id, job_id, tx)) = background_job {
+                        let _ = tx.send(WorkerEvent::JobUpdated {
+                            session_id: session_id.to_string(),
+                            job_id: job_id.to_string(),
+                            status: JobStatus::Running,
+                            summary: format!("{}: {}", phase.status(), call.name),
+                        });
+                    }
                     let execution = tools::execute_tool(
                         &tool_ctx,
                         &call.name,
@@ -595,14 +1045,23 @@ pub(crate) fn run_specialist_loop(
                         output: execution.output.clone(),
                     });
 
+                    conversation.push(ProviderMessage {
+                        role: Role::ToolResult,
+                        content: execution.output.clone(),
+                        tool_calls: None,
+                        tool_call_id: Some(call.id.clone()),
+                        attachments: Vec::new(),
+                    });
+
                     if !execution.attachments.is_empty() {
                         conversation.push(ProviderMessage {
-                            role: Role::ToolResult,
+                            role: Role::System,
                             content: format!(
                                 "Tool `{}` attached media from the workspace for inspection. Use the attachment directly when answering.",
                                 call.name
                             ),
                             tool_calls: None,
+                            tool_call_id: None,
                             attachments: execution.attachments.clone(),
                         });
                     }
@@ -649,7 +1108,15 @@ pub(crate) fn run_specialist_loop(
                         turn_id: turn_id.to_string(),
                         phase,
                         status: TurnStepStatus::Completed,
-                        summary: Some(step_summary),
+                        summary: Some(step_summary.clone()),
+                    });
+                }
+                if let Some((session_id, job_id, tx)) = background_job {
+                    let _ = tx.send(WorkerEvent::JobUpdated {
+                        session_id: session_id.to_string(),
+                        job_id: job_id.to_string(),
+                        status: JobStatus::Running,
+                        summary: step_summary.clone(),
                     });
                 }
             } else {
@@ -660,6 +1127,7 @@ pub(crate) fn run_specialist_loop(
                         role: Role::Assistant,
                         content: text_content,
                         tool_calls: None,
+                        tool_call_id: None,
                         attachments: Vec::new(),
                     });
                 } else if !text_content.trim().is_empty() {
@@ -689,7 +1157,15 @@ pub(crate) fn run_specialist_loop(
                         turn_id: turn_id.to_string(),
                         phase,
                         status: TurnStepStatus::Completed,
-                        summary: Some(step_summary),
+                        summary: Some(step_summary.clone()),
+                    });
+                }
+                if let Some((session_id, job_id, tx)) = background_job {
+                    let _ = tx.send(WorkerEvent::JobUpdated {
+                        session_id: session_id.to_string(),
+                        job_id: job_id.to_string(),
+                        status: JobStatus::Running,
+                        summary: step_summary.clone(),
                     });
                 }
             }
@@ -1021,26 +1497,9 @@ fn summarize_job_title(request: &ProviderRequest) -> String {
 }
 
 fn build_direct_turn_request(request: &ProviderRequest, instructions: String) -> ModelTurnRequest {
-    let input: Vec<serde_json::Value> = request.messages.iter().map(|m| m.as_json()).collect();
-    let chat_messages = build_chat_completion_messages(&request.messages, &instructions);
-    ModelTurnRequest {
-        body: serde_json::json!({
-            "model": request.model,
-            "instructions": instructions,
-            "input": input,
-            "tools": [],
-            "tool_choice": "none",
-            "parallel_tool_calls": false,
-            "reasoning": null,
-            "store": false,
-            "stream": true,
-            "_chat_completions_preview": {
-                "messages": chat_messages,
-                "tools": [],
-            },
-        }),
-        emit_text_events: true,
-    }
+    let turn_messages = prepend_system_message(&request.messages, instructions);
+    let chat_messages = build_chat_completion_messages(&turn_messages);
+    ChatCompletionsRequestBuilder::direct(request.model.clone(), chat_messages).build()
 }
 
 fn build_specialist_turn_request(
@@ -1057,43 +1516,34 @@ fn build_specialist_turn_request(
         .chain(continuation_messages.iter())
         .cloned()
         .collect();
-    let input: Vec<serde_json::Value> = combined_messages.iter().map(|m| m.as_json()).collect();
-    let chat_messages = build_chat_completion_messages(&combined_messages, &instructions);
-    let chat_tools = allowed_tools.clone();
-
-    ModelTurnRequest {
-        body: serde_json::json!({
-            "model": request.model,
-            "instructions": instructions,
-            "input": input,
-            "tools": allowed_tools,
-            "tool_choice": tool_choice,
-            "parallel_tool_calls": false,
-            "reasoning": null,
-            "store": false,
-            "stream": true,
-            "_chat_completions_preview": {
-                "messages": chat_messages,
-                "tools": chat_tools,
-            },
-        }),
-        emit_text_events,
-    }
+    let turn_messages = prepend_system_message(&combined_messages, instructions);
+    let chat_messages = build_chat_completion_messages(&turn_messages);
+    ChatCompletionsRequestBuilder::specialist(request.model.clone(), chat_messages, allowed_tools)
+        .tool_choice(serde_json::json!(tool_choice))
+        .emit_text_events(emit_text_events)
+        .build()
 }
 
-fn build_chat_completion_messages(
-    messages: &[ProviderMessage],
-    instructions: &str,
-) -> Vec<serde_json::Value> {
-    let mut serialized = Vec::with_capacity(messages.len() + 1);
+fn build_chat_completion_messages(messages: &[ProviderMessage]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(ProviderMessage::as_chat_completion_message)
+        .collect()
+}
+
+fn prepend_system_message(messages: &[ProviderMessage], instructions: String) -> Vec<ProviderMessage> {
+    let mut turn_messages = Vec::with_capacity(messages.len() + 1);
     if !instructions.trim().is_empty() {
-        serialized.push(serde_json::json!({
-            "role": "system",
-            "content": instructions,
-        }));
+        turn_messages.push(ProviderMessage {
+            role: Role::System,
+            content: instructions,
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: Vec::new(),
+        });
     }
-    serialized.extend(messages.iter().map(ProviderMessage::as_chat_completion_message));
-    serialized
+    turn_messages.extend(messages.iter().cloned());
+    turn_messages
 }
 
 fn dedupe_tool_calls(tool_calls: Vec<ToolCall>) -> Vec<ToolCall> {
@@ -1154,5 +1604,330 @@ fn should_advance_phase(
         AgentPhase::Plan => true,
         AgentPhase::Explore | AgentPhase::Act | AgentPhase::Verify => !used_tools_this_iteration,
         AgentPhase::Respond => true,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StubToolCall {
+    id: String,
+    name: String,
+    args: serde_json::Value,
+}
+
+impl StubToolCall {
+    fn as_chat_completion_call(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "arguments": serde_json::to_string(&self.args).unwrap_or_else(|_| "null".to_string()),
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StubToolPlan {
+    explore: Option<StubPhaseCall>,
+    act: Option<StubPhaseCall>,
+    verify: Option<StubPhaseCall>,
+}
+
+impl StubToolPlan {
+    fn from_prompt(prompt: &str, agent: AgentKind) -> Self {
+        let lowered = prompt.to_lowercase();
+        let mut plan = if lowered.contains("write") {
+            Self {
+                explore: Some(StubPhaseCall::list_workspace()),
+                act: Some(StubPhaseCall::write_note()),
+                verify: Some(StubPhaseCall::read_note()),
+            }
+        } else if lowered.contains("read") {
+            Self {
+                explore: Some(StubPhaseCall::list_workspace()),
+                act: Some(StubPhaseCall::read_note()),
+                verify: Some(StubPhaseCall::list_workspace()),
+            }
+        } else if lowered.contains("test") || lowered.contains("cargo") {
+            Self {
+                explore: Some(StubPhaseCall::list_workspace()),
+                act: Some(StubPhaseCall::run_tests()),
+                verify: Some(StubPhaseCall::list_workspace()),
+            }
+        } else if lowered.contains("list") || lowered.contains("files") {
+            Self {
+                explore: Some(StubPhaseCall::list_workspace()),
+                act: Some(StubPhaseCall::read_note()),
+                verify: None,
+            }
+        } else {
+            Self {
+                explore: None,
+                act: None,
+                verify: None,
+            }
+        };
+
+        if matches!(agent, AgentKind::Analyst) && plan.explore.is_none() {
+            plan.explore = Some(StubPhaseCall::list_workspace());
+        }
+
+        plan
+    }
+
+    fn has_tools(&self) -> bool {
+        self.explore.is_some() || self.act.is_some() || self.verify.is_some()
+    }
+
+    fn call_for_phase(&self, phase: AgentPhase) -> Option<&StubPhaseCall> {
+        match phase {
+            AgentPhase::Explore => self.explore.as_ref(),
+            AgentPhase::Act => self.act.as_ref(),
+            AgentPhase::Verify => self.verify.as_ref(),
+            AgentPhase::Plan | AgentPhase::Respond => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StubPhaseCall {
+    tool_name: &'static str,
+    args: serde_json::Value,
+    description: &'static str,
+}
+
+impl StubPhaseCall {
+    fn list_workspace() -> Self {
+        Self {
+            tool_name: "fs_list",
+            args: serde_json::json!({ "path": "." }),
+            description: "inspect the workspace tree",
+        }
+    }
+
+    fn read_note() -> Self {
+        Self {
+            tool_name: "fs_read",
+            args: serde_json::json!({ "path": "stub-note.txt" }),
+            description: "read a deterministic workspace file",
+        }
+    }
+
+    fn write_note() -> Self {
+        Self {
+            tool_name: "fs_write",
+            args: serde_json::json!({
+                "path": "stub-note.txt",
+                "content": "stub provider wrote this file for migration validation\n"
+            }),
+            description: "write a deterministic workspace file",
+        }
+    }
+
+    fn run_tests() -> Self {
+        Self {
+            tool_name: "sh_run",
+            args: serde_json::json!({ "command": "cargo test --quiet" }),
+            description: "run a deterministic validation command",
+        }
+    }
+
+    fn to_tool_call(&self, phase: AgentPhase) -> StubToolCall {
+        StubToolCall {
+            id: format!("stub-{}-{}", phase.as_str().to_lowercase(), self.tool_name),
+            name: self.tool_name.to_string(),
+            args: self.args.clone(),
+        }
+    }
+
+    fn assistant_preface(&self, phase: AgentPhase) -> String {
+        format!(
+            "Stub {} phase will {}.",
+            phase.as_str().to_lowercase(),
+            self.description
+        )
+    }
+}
+
+struct StubExecution {
+    output: String,
+    board_ops: Vec<BoardOperation>,
+}
+
+fn latest_user_message(messages: &[ProviderMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| matches!(message.role, Role::User))
+        .map(|message| message.content.clone())
+        .unwrap_or_default()
+}
+
+fn stub_plain_response(request: &ProviderRequest) -> String {
+    let prompt = latest_user_message(&request.messages);
+    if prompt.trim().is_empty() {
+        "Stub provider is ready for migration testing.".to_string()
+    } else {
+        format!(
+            "Stub provider handled this without tools: {}",
+            prompt.trim()
+        )
+    }
+}
+
+fn stub_phase_note(label: &str, phase: AgentPhase, prompt: &str, plan: &StubToolPlan) -> String {
+    if plan.has_tools() {
+        format!(
+            "Stub {label} plan for {} phase: use deterministic tool calls for `{}`.",
+            phase.as_str(),
+            prompt.trim()
+        )
+    } else {
+        format!(
+            "Stub {label} plan for {} phase: answer directly without tool usage.",
+            phase.as_str()
+        )
+    }
+}
+
+fn stub_final_response(
+    label: &str,
+    prompt: &str,
+    plan: &StubToolPlan,
+    conversation: &[ProviderMessage],
+) -> String {
+    let tool_outputs: Vec<&str> = conversation
+        .iter()
+        .filter(|message| matches!(message.role, Role::ToolResult))
+        .map(|message| message.content.trim())
+        .filter(|content| !content.is_empty())
+        .collect();
+
+    if !tool_outputs.is_empty() {
+        format!(
+            "Stub {label} completed `{}` using {} deterministic tool step(s). Latest tool output: {}",
+            prompt.trim(),
+            tool_outputs.len(),
+            tool_outputs.last().copied().unwrap_or("completed")
+        )
+    } else if plan.has_tools() {
+        format!(
+            "Stub {label} completed `{}` with the deterministic plan but no tool output was produced.",
+            prompt.trim()
+        )
+    } else {
+        format!(
+            "Stub {label} answered `{}` directly without tools.",
+            prompt.trim()
+        )
+    }
+}
+
+fn stream_stub_delta_chunks(
+    reply: &str,
+    session_id: &str,
+    turn_id: &str,
+    tx: &Sender<WorkerEvent>,
+) -> Result<()> {
+    for chunk in reply.split_inclusive(' ') {
+        thread::sleep(Duration::from_millis(20));
+        tx.send(WorkerEvent::Delta {
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+            delta: chunk.to_string(),
+        })
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    }
+    Ok(())
+}
+
+fn execute_stub_tool(sandbox: &Sandbox, tool_call: &StubToolCall) -> Result<StubExecution> {
+    match tool_call.name.as_str() {
+        "fs_list" => {
+            let target = tool_call
+                .args
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or(".");
+            let root = sandbox.resolve(target)?;
+            let mut entries: Vec<String> = std::fs::read_dir(root)?
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().to_string())
+                .collect();
+            entries.sort();
+            Ok(StubExecution {
+                output: if entries.is_empty() {
+                    "workspace is empty".to_string()
+                } else {
+                    format!("workspace entries: {}", entries.join(", "))
+                },
+                board_ops: Vec::new(),
+            })
+        }
+        "fs_read" => {
+            let target = tool_call
+                .args
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or("stub-note.txt");
+            let path = sandbox.resolve(target)?;
+            let output = std::fs::read_to_string(path)
+                .unwrap_or_else(|_| "stub-note.txt is not present yet".to_string());
+            Ok(StubExecution {
+                output,
+                board_ops: Vec::new(),
+            })
+        }
+        "fs_write" => {
+            let target = tool_call
+                .args
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or("stub-note.txt");
+            let content = tool_call
+                .args
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or("stub provider wrote this file\n");
+            let path = sandbox.resolve(target)?;
+            std::fs::write(path, content)?;
+            Ok(StubExecution {
+                output: format!("wrote {}", target),
+                board_ops: vec![BoardOperation::AddFact {
+                    fact: format!("stub wrote {}", target),
+                }],
+            })
+        }
+        "sh_run" => {
+            let command = tool_call
+                .args
+                .get("command")
+                .and_then(|value| value.as_str())
+                .unwrap_or("cargo test --quiet");
+            let output = if cfg!(target_os = "windows") {
+                std::process::Command::new("cmd")
+                    .args(["/C", command])
+                    .current_dir(&sandbox.root)
+                    .output()?
+            } else {
+                std::process::Command::new("sh")
+                    .args(["-c", command])
+                    .current_dir(&sandbox.root)
+                    .output()?
+            };
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok(StubExecution {
+                output: format!("{}{}", stdout, stderr).trim().to_string(),
+                board_ops: vec![BoardOperation::AddFact {
+                    fact: format!("stub ran {}", command),
+                }],
+            })
+        }
+        other => Ok(StubExecution {
+            output: format!("stub provider does not implement {}", other),
+            board_ops: Vec::new(),
+        }),
     }
 }

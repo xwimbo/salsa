@@ -20,7 +20,10 @@ mod models;
 mod tools;
 mod ui;
 
-use agent::provider::{CodexProvider, EchoProvider, Provider};
+use agent::provider::{
+    CodexProvider, EchoProvider, LocalChatCompletionsProvider, Provider, StubCompletionsProvider,
+};
+use auth::CodexAuth;
 use api::CodexClient;
 use app::App;
 use tools::Sandbox;
@@ -93,19 +96,50 @@ fn run(terminal: &mut Tui, app: &mut App) -> Result<()> {
     Ok(())
 }
 
+fn build_provider(
+    cfg: &config::Config,
+    paths: &config::Paths,
+    auth: &CodexAuth,
+) -> Result<Box<dyn Provider>> {
+    let local_auth = CodexAuth::default();
+    let configured = cfg.provider_kind.trim().to_lowercase();
+
+    let build_codex = || -> Result<Box<dyn Provider>> {
+        Ok(Box::new(CodexProvider::new(
+            auth.clone(),
+            paths.workspace.clone(),
+        )?))
+    };
+    let build_local = || -> Result<Box<dyn Provider>> {
+        Ok(Box::new(LocalChatCompletionsProvider::new(
+            local_auth.clone(),
+            paths.workspace.clone(),
+            cfg.local_provider_base_url.clone(),
+            cfg.local_provider_api_key.clone(),
+            Duration::from_secs(cfg.local_provider_timeout_secs.max(1)),
+        )?))
+    };
+    let build_stub = || -> Result<Box<dyn Provider>> {
+        Ok(Box::new(StubCompletionsProvider::new(paths.workspace.clone())?))
+    };
+
+    match configured.as_str() {
+        "codex" => build_codex().or_else(|_| build_stub()),
+        "local" => build_local().or_else(|_| build_stub()),
+        "stub" => build_stub(),
+        "echo" => Ok(Box::new(EchoProvider)),
+        _ => build_codex()
+            .or_else(|_| build_local())
+            .or_else(|_| build_stub())
+            .or(Ok(Box::new(EchoProvider))),
+    }
+}
+
 fn main() -> Result<()> {
     install_panic_hook();
     let (cfg, paths) = config::bootstrap()?;
-    // Legacy startup wiring still selects between Codex Responses transport and
-    // the echo fallback directly. Step 13 will replace this with explicit,
-    // configurable provider selection for migration providers.
-    let (provider, auth): (Box<dyn Provider>, _) = match auth::CodexAuth::load_from_disk() {
-        Ok(auth) => (
-            Box::new(CodexProvider::new(auth.clone(), paths.workspace.clone())?),
-            auth,
-        ),
-        Err(_) => (Box::new(EchoProvider), auth::CodexAuth::default()),
-    };
+    let auth = CodexAuth::load_from_disk().unwrap_or_default();
+    let provider = build_provider(&cfg, &paths, &auth)?;
     let worker = agent::worker::spawn_worker(Arc::from(provider));
 
     // Start background cron scheduler. This still uses the legacy Codex-backed

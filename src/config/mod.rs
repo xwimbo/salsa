@@ -18,6 +18,11 @@ pub struct Config {
     pub sid: String,
     pub email: String,
     pub api_key: String,
+    pub provider_kind: String,
+    pub local_provider_base_url: String,
+    pub local_provider_api_key: String,
+    pub local_provider_model: String,
+    pub local_provider_timeout_secs: u64,
 }
 
 impl Default for Config {
@@ -34,6 +39,11 @@ impl Default for Config {
             sid: String::new(),
             email: String::new(),
             api_key: String::new(),
+            provider_kind: "auto".into(),
+            local_provider_base_url: "http://127.0.0.1:11434/v1/chat/completions".into(),
+            local_provider_api_key: "local-dev-token".into(),
+            local_provider_model: "qwen2.5-coder:7b".into(),
+            local_provider_timeout_secs: 120,
         }
     }
 }

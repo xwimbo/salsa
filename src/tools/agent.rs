@@ -43,6 +43,7 @@ pub fn execute(
             role: Role::User,
             content: prompt.to_string(),
             tool_calls: None,
+            tool_call_id: None,
             attachments: Vec::new(),
         }],
         model: model.to_string(),

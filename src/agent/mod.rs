@@ -28,52 +28,37 @@ pub struct ProviderMessage {
     pub role: Role,
     pub content: String,
     pub tool_calls: Option<serde_json::Value>,
+    pub tool_call_id: Option<String>,
     pub attachments: Vec<ProviderAttachment>,
 }
 
 impl ProviderMessage {
-    pub fn as_json(&self) -> serde_json::Value {
-        // Legacy Responses transport serializer. This intentionally emits
-        // `input_text`/`output_text` content items instead of Chat Completions
-        // `messages`, so migration work can isolate and replace this path later.
-        let mut content = Vec::new();
-        match self.role {
-            Role::User | Role::System | Role::ToolResult => {
-                if !self.content.is_empty() {
-                    content.push(serde_json::json!({
-                        "type": "input_text",
-                        "text": self.content
-                    }));
-                }
-                for attachment in &self.attachments {
-                    content.push(attachment.as_json());
-                }
-            }
-            Role::Assistant => {
-                if !self.content.is_empty() {
-                    content.push(serde_json::json!({
-                        "type": "output_text",
-                        "text": self.content
-                    }));
-                }
-            }
-        }
-
-        match self.role {
-            Role::User => serde_json::json!({ "role": "user", "content": content }),
-            Role::Assistant => serde_json::json!({ "role": "assistant", "content": content }),
-            Role::System | Role::ToolResult => serde_json::json!({ "role": "system", "content": content }),
-        }
-    }
-
+    // `ProviderMessage` remains the app-facing conversation type; transport-
+    // specific shaping is isolated to this serializer so the rest of the app can
+    // keep working with a stable message model across normal chat, tool calls,
+    // tool results, system instructions, and attachment-bearing context.
     pub fn as_chat_completion_message(&self) -> serde_json::Value {
+        if matches!(self.role, Role::Assistant) && self.tool_calls.is_some() {
+            return serde_json::json!({
+                "role": "assistant",
+                "content": if self.content.is_empty() { serde_json::Value::Null } else { serde_json::json!(self.content) },
+                "tool_calls": self.tool_calls.clone().unwrap_or_else(|| serde_json::json!([])),
+            });
+        }
+
+        if matches!(self.role, Role::ToolResult) {
+            return serde_json::json!({
+                "role": "tool",
+                "tool_call_id": self.tool_call_id.clone().unwrap_or_default(),
+                "content": self.content,
+            });
+        }
+
         let role = match self.role {
             Role::User => "user",
             Role::Assistant => "assistant",
             Role::System => "system",
-            // Until step 9 defines native tool-result feedback, keep tool results
-            // as synthetic system context in the Chat Completions message stream.
-            Role::ToolResult => "system",
+            Role::ToolResult => "tool",
         };
 
         let mut content = Vec::new();
@@ -109,27 +94,6 @@ impl ProviderMessage {
 }
 
 impl ProviderAttachment {
-    fn as_json(&self) -> serde_json::Value {
-        match self {
-            ProviderAttachment::Image {
-                mime_type,
-                data_base64,
-            } => serde_json::json!({
-                "type": "input_image",
-                "image_url": format!("data:{};base64,{}", mime_type, data_base64),
-            }),
-            ProviderAttachment::File {
-                mime_type,
-                filename,
-                data_base64,
-            } => serde_json::json!({
-                "type": "input_file",
-                "filename": filename,
-                "file_data": format!("data:{};base64,{}", mime_type, data_base64),
-            }),
-        }
-    }
-
     fn as_chat_completion_content_part(&self) -> Option<serde_json::Value> {
         match self {
             ProviderAttachment::Image {
@@ -153,6 +117,119 @@ impl ProviderAttachment {
                 }
             })),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProviderAttachment, ProviderMessage};
+    use crate::models::Role;
+
+    #[test]
+    fn serializes_plain_text_messages_for_chat_completions() {
+        let system = ProviderMessage {
+            role: Role::System,
+            content: "follow the plan".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: Vec::new(),
+        };
+        let user = ProviderMessage {
+            role: Role::User,
+            content: "hello".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: Vec::new(),
+        };
+
+        assert_eq!(
+            system.as_chat_completion_message(),
+            serde_json::json!({"role": "system", "content": "follow the plan"})
+        );
+        assert_eq!(
+            user.as_chat_completion_message(),
+            serde_json::json!({"role": "user", "content": "hello"})
+        );
+    }
+
+    #[test]
+    fn serializes_assistant_tool_calls_for_chat_completions() {
+        let message = ProviderMessage {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(serde_json::json!([
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "fs_list", "arguments": "{\"path\":\".\"}"}
+                }
+            ])),
+            tool_call_id: None,
+            attachments: Vec::new(),
+        };
+
+        assert_eq!(
+            message.as_chat_completion_message(),
+            serde_json::json!({
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "fs_list", "arguments": "{\"path\":\".\"}"}
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_tool_result_messages_for_chat_completions() {
+        let message = ProviderMessage {
+            role: Role::ToolResult,
+            content: "workspace entries: src".into(),
+            tool_calls: None,
+            tool_call_id: Some("call-1".into()),
+            attachments: Vec::new(),
+        };
+
+        assert_eq!(
+            message.as_chat_completion_message(),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "workspace entries: src"
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_attachment_messages_as_content_parts() {
+        let message = ProviderMessage {
+            role: Role::User,
+            content: "inspect this image".into(),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: vec![ProviderAttachment::Image {
+                mime_type: "image/png".into(),
+                data_base64: "abc123".into(),
+            }],
+        };
+
+        assert_eq!(
+            message.as_chat_completion_message(),
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "inspect this image"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc123"}
+                    }
+                ]
+            })
+        );
     }
 }
 
